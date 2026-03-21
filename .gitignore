@@ -1,0 +1,17 @@
+/_build/
+/cover/
+/deps/
+/doc/
+*.ez
+/tmp/
+erl_crash.dump
+
+# Rust
+native/engine/target/
+
+# Compiled NIFs
+priv/native/
+*.so
+
+# Data
+/data/

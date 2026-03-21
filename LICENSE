@@ -1,0 +1,106 @@
+Business Source License 1.1
+
+Parameters
+
+Licensor:             Jagrit Gumber
+Licensed Work:        pgrx
+                      The Licensed Work is (c) 2026 Jagrit Gumber.
+Additional Use Grant: You may use the Licensed Work for any non-commercial
+                      purpose, including personal use, academic research,
+                      educational use, and evaluation. You may contribute
+                      to the Licensed Work under the Contributor License
+                      below. You may NOT use the Licensed Work, or any
+                      derivative work, for any commercial purpose, including
+                      but not limited to: selling, offering as a paid
+                      service, bundling with a paid product, or generating
+                      revenue directly or indirectly from the Licensed Work.
+Change Date:          2030-03-21
+Change License:       GNU Affero General Public License v3.0 (AGPL-3.0)
+
+-----------------------------------------------------------------------------
+
+Business Source License 1.1
+
+License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
+
+Terms
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited
+production use.
+
+Effective on the Change Date, or the fourth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensor hereby grants you rights under
+the terms of the Change License, and the rights granted in the paragraph
+above terminate.
+
+If your use of the Licensed Work does not comply with the requirements
+currently in effect as described in this License, you must purchase a
+commercial license from the Licensor, its affiliated entities, or authorized
+resellers, or you must refrain from using the Licensed Work.
+
+All copies of the original and modified Licensed Work, and derivative works
+of the Licensed Work, are subject to this License. This License applies
+separately for each version of the Licensed Work and the Change Date may vary
+for each version of the Licensed Work released by Licensor.
+
+You must conspicuously display this License on each original or modified copy
+of the Licensed Work. If you receive the Licensed Work in original or
+modified form from a third party, the terms and conditions set forth in this
+License apply to your use of that work.
+
+Any use of the Licensed Work in violation of this License will automatically
+terminate your rights under this License for the current and all other
+versions of the Licensed Work.
+
+This License does not grant you any right in any trademark or logo of
+Licensor or its affiliates (provided that you may use a trademark or logo of
+Licensor as expressly required by this License).
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON
+AN "AS IS" BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS,
+EXPRESS OR IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND
+TITLE.
+
+MariaDB hereby grants you permission to use this License's text to license
+your works, and to refer to it using the trademark "Business Source License",
+as long as you comply with the Coward Conditions of MariaDB's Business Source
+License Addendum, which are as follows:
+
+  You must not make any alteration or addition to the text of this license
+  in a way that would change the meaning of the license or the rights
+  granted under the license, unless you remove all references to the
+  trademark "Business Source License" and the Licensor's name from the
+  license text.
+
+-----------------------------------------------------------------------------
+
+Contributor License
+
+By contributing to this project (via pull request, patch, or any other
+mechanism), you agree that:
+
+1. Your contributions are licensed under the same terms as this License.
+2. You have the right to submit the contribution under these terms.
+3. The Licensor may use your contributions in any way consistent with this
+   License, including in commercial offerings by the Licensor.
+
+-----------------------------------------------------------------------------
+
+Summary (not legally binding):
+
+  ✓ Use for free for personal, educational, and non-commercial purposes
+  ✓ Contribute to the project
+  ✓ Fork and modify (under the same license terms)
+  ✓ Self-host for non-commercial use
+  ✗ Sell or offer as a commercial service
+  ✗ Fork and make proprietary / closed-source
+  ✗ Generate revenue from the software
+
+  On 2030-03-21 (or 4 years after any version's release), that version
+  converts to AGPL-3.0, which requires all forks and derivative works
+  to remain open source forever.
