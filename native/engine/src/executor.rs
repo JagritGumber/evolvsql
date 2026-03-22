@@ -92,16 +92,31 @@ fn resolve_column(
         2 => {
             // Qualified: qualifier.column
             let (qualifier, col_name) = (&fields[0], &fields[1]);
-            let src = ctx
-                .sources
-                .iter()
-                .find(|s| s.alias == *qualifier || s.table_name == *qualifier)
-                .ok_or_else(|| {
-                    format!(
-                        "missing FROM-clause entry for table \"{}\"",
-                        qualifier
-                    )
-                })?;
+            // First try exact alias match, then table_name match with ambiguity check
+            let matches: Vec<_> = ctx.sources.iter()
+                .filter(|s| s.alias == *qualifier)
+                .collect();
+            let src = if matches.len() == 1 {
+                matches[0]
+            } else if matches.is_empty() {
+                // Fall back to table_name match
+                let by_name: Vec<_> = ctx.sources.iter()
+                    .filter(|s| s.table_name == *qualifier)
+                    .collect();
+                match by_name.len() {
+                    0 => return Err(format!(
+                        "missing FROM-clause entry for table \"{}\"", qualifier
+                    )),
+                    1 => by_name[0],
+                    _ => return Err(format!(
+                        "table reference \"{}\" is ambiguous", qualifier
+                    )),
+                }
+            } else {
+                return Err(format!(
+                    "table reference \"{}\" is ambiguous", qualifier
+                ));
+            };
             let pos = src
                 .table_def
                 .columns
@@ -117,14 +132,22 @@ fn resolve_column(
 }
 
 /// Get the type OID for a column index in a JoinContext.
-fn column_type_oid(idx: usize, ctx: &JoinContext) -> i32 {
+fn column_type_oid(idx: usize, ctx: &JoinContext) -> Result<i32, String> {
     for src in &ctx.sources {
         let end = src.col_offset + src.table_def.columns.len();
         if idx >= src.col_offset && idx < end {
-            return src.table_def.columns[idx - src.col_offset].type_oid.oid();
+            return Ok(src.table_def.columns[idx - src.col_offset].type_oid.oid());
         }
     }
-    TypeOid::Text.oid()
+    // Fallback for expression columns or empty context
+    if ctx.sources.is_empty() {
+        Ok(TypeOid::Text.oid())
+    } else {
+        Err(format!(
+            "internal error: column index {} not found in any source (total: {})",
+            idx, ctx.total_columns
+        ))
+    }
 }
 
 pub fn execute(sql: &str) -> Result<QueryResult, String> {
@@ -541,7 +564,16 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
     match node {
         NodeEnum::ColumnRef(cref) => {
             let idx = resolve_column(cref, ctx)?;
-            Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+            if idx < row.len() {
+                Ok(row[idx].clone())
+            } else if ctx.total_columns == 0 {
+                Ok(Value::Null) // no-FROM context (SELECT 1)
+            } else {
+                Err(format!(
+                    "internal error: column index {} out of range for row of width {}",
+                    idx, row.len()
+                ))
+            }
         }
         NodeEnum::AConst(ac) => {
             if ac.isnull {
@@ -971,7 +1003,14 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
                 sources,
             };
 
-            // Build ON quals
+            // USING and NATURAL JOIN not yet supported
+            if !je.using_clause.is_empty() {
+                return Err("JOIN ... USING is not yet supported; use JOIN ... ON instead".into());
+            }
+            if je.is_natural {
+                return Err("NATURAL JOIN is not yet supported; use JOIN ... ON instead".into());
+            }
+
             let quals = je.quals.as_ref().and_then(|n| n.node.as_ref());
 
             let result = nested_loop_join(
@@ -1002,9 +1041,15 @@ fn nested_loop_join(
     let null_right = vec![Value::Null; right_width];
     let null_left = vec![Value::Null; left_width];
     let mut result = Vec::with_capacity(left_rows.len());
+    let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
+        || join_type == pg_query::protobuf::JoinType::Undefined as i32;
     let is_left = join_type == pg_query::protobuf::JoinType::JoinLeft as i32;
     let is_right = join_type == pg_query::protobuf::JoinType::JoinRight as i32;
     let is_full = join_type == pg_query::protobuf::JoinType::JoinFull as i32;
+
+    if !is_inner && !is_left && !is_right && !is_full {
+        return Err(format!("unsupported JOIN type: {}", join_type));
+    }
     let mut right_matched = if is_right || is_full {
         vec![false; right_rows.len()]
     } else {
@@ -1245,11 +1290,11 @@ fn exec_select(
         .iter()
         .map(|t| match t {
             SelectTarget::Column { name, idx } => {
-                (name.clone(), column_type_oid(*idx, &ctx))
+                Ok((name.clone(), column_type_oid(*idx, &ctx)?))
             }
-            SelectTarget::Expr { name, .. } => (name.clone(), TypeOid::Text.oid()),
+            SelectTarget::Expr { name, .. } => Ok((name.clone(), TypeOid::Text.oid())),
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
     for row in &rows {
@@ -1294,8 +1339,7 @@ fn exec_select_no_from(
                 rt.name.clone()
             };
             let val = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-                Some(expr) => eval_expr(expr, &[], &dummy_ctx)
-                    .unwrap_or(Value::Null),
+                Some(expr) => eval_expr(expr, &[], &dummy_ctx)?,
                 None => Value::Null,
             };
             columns.push((alias, TypeOid::Text.oid()));
@@ -1498,7 +1542,7 @@ fn exec_select_aggregate(
                                 rt.name.clone()
                             };
                             result_columns
-                                .push((alias, column_type_oid(col_idx, ctx)));
+                                .push((alias, column_type_oid(col_idx, ctx)?));
                         }
 
                         let key_pos = group_col_indices
