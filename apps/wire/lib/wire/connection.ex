@@ -108,232 +108,19 @@ defmodule Wire.Connection do
     end
   end
 
-  # --- Error Sync: skip everything except Sync ---
-
-  defp dispatch(socket, %{error_sync: true} = state, ?S, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, _} ->
-        state = %{state | error_sync: false}
-        :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
-        loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  defp dispatch(socket, %{error_sync: true} = state, _type, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, _} -> loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  # --- Simple Query (?Q) ---
-
-  defp dispatch(socket, state, ?Q, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, data} ->
-        # Simple query invalidates unnamed statement and portal
-        state = state
-          |> put_in([:stmts], Map.delete(state.stmts, ""))
-          |> put_in([:portals], Map.delete(state.portals, ""))
-        sql = data |> String.trim_trailing(<<0>>) |> String.trim()
-        execute_query(socket, sql)
-        :erlang.garbage_collect()
-        loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  # --- Terminate (?X) ---
-
+  # Unified dispatch: read body from socket, then delegate to dispatch_with_body.
+  # This eliminates ~200 lines of duplication between the normal and wake paths.
   defp dispatch(socket, _state, ?X, _body_len) do
     :gen_tcp.close(socket)
   end
 
-  # --- Parse (?P) ---
-
-  defp dispatch(socket, state, ?P, body_len) do
+  defp dispatch(socket, state, type, body_len) do
     case recv_body(socket, body_len) do
-      {:ok, data} ->
-        {stmt_name, rest} = read_cstring(data)
-        {query_sql, rest} = read_cstring(rest)
-        {param_oids, _rest} = parse_param_oids(rest)
-
-        if stmt_name != "" and Map.has_key?(state.stmts, stmt_name) do
-          state = handle_extended_error(socket, "42P05",
-            "prepared statement \"#{stmt_name}\" already exists", state)
-          loop(socket, state)
-        else
-          entry = %{sql: query_sql, param_oids: param_oids}
-          state = put_in(state, [:stmts, stmt_name], entry)
-          :gen_tcp.send(socket, <<"1", 4::32>>)
-          loop(socket, state)
-        end
+      {:ok, body} -> dispatch_with_body(socket, state, type, body)
       :error -> :ok
     end
   end
 
-  # --- Bind (?B) ---
-
-  defp dispatch(socket, state, ?B, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, data} ->
-        {portal_name, rest} = read_cstring(data)
-        {stmt_name, rest} = read_cstring(rest)
-
-        case Map.fetch(state.stmts, stmt_name) do
-          :error ->
-            state = handle_extended_error(socket, "26000",
-              "prepared statement \"#{stmt_name}\" does not exist", state)
-            loop(socket, state)
-
-          {:ok, stmt} ->
-            {_fmt_codes, rest} = parse_format_codes(rest)
-            {params, rest} = parse_bind_params(rest)
-            {_result_fmt, _rest} = parse_format_codes(rest)
-
-            bound_sql = substitute_params(stmt.sql, params)
-            portal = %{stmt_name: stmt_name, params: params, sql: bound_sql}
-            state = put_in(state, [:portals, portal_name], portal)
-            :gen_tcp.send(socket, <<"2", 4::32>>)
-            loop(socket, state)
-        end
-      :error -> :ok
-    end
-  end
-
-  # --- Describe (?D) ---
-
-  defp dispatch(socket, state, ?D, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, <<kind, rest::binary>>} ->
-        {name, _} = read_cstring(rest)
-        case kind do
-          ?S ->
-            case Map.fetch(state.stmts, name) do
-              {:ok, stmt} ->
-                send_parameter_description(socket, stmt.param_oids)
-                # Try to describe result columns by inspecting the SQL
-                describe_statement_result(socket, stmt.sql)
-                loop(socket, state)
-              :error ->
-                state = handle_extended_error(socket, "26000",
-                  "prepared statement \"#{name}\" does not exist", state)
-                loop(socket, state)
-            end
-          ?P ->
-            case Map.fetch(state.portals, name) do
-              {:ok, portal} ->
-                describe_portal_result(socket, portal.sql)
-                loop(socket, state)
-              :error ->
-                state = handle_extended_error(socket, "34000",
-                  "portal \"#{name}\" does not exist", state)
-                loop(socket, state)
-            end
-          _ ->
-            state = handle_extended_error(socket, "08P01",
-              "invalid Describe target", state)
-            loop(socket, state)
-        end
-      {:ok, _} ->
-        state = handle_extended_error(socket, "08P01", "malformed Describe", state)
-        loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  # --- Execute (?E) ---
-
-  defp dispatch(socket, state, ?E, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, data} ->
-        {portal_name, rest} = read_cstring(data)
-        _max_rows = case rest do
-          <<n::32>> -> n
-          <<n::32, _::binary>> -> n
-          _ -> 0
-        end
-
-        case Map.fetch(state.portals, portal_name) do
-          :error ->
-            state = handle_extended_error(socket, "34000",
-              "portal \"#{portal_name}\" does not exist", state)
-            loop(socket, state)
-
-          {:ok, portal} ->
-            case run_query(portal.sql) do
-              {:rows, cols, rows, tag} ->
-                buf = [
-                  encode_row_desc(cols),
-                  Enum.map(rows, &encode_data_row/1),
-                  encode_complete(tag)
-                ]
-                :gen_tcp.send(socket, buf)
-                loop(socket, state)
-
-              {:command, tag} ->
-                :gen_tcp.send(socket, encode_complete(tag))
-                loop(socket, state)
-
-              {:error, msg} ->
-                state = handle_extended_error(socket, "42601", msg, state)
-                loop(socket, state)
-            end
-        end
-      :error -> :ok
-    end
-  end
-
-  # --- Sync (?S) ---
-
-  defp dispatch(socket, state, ?S, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, _} ->
-        state = %{state | error_sync: false}
-        :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
-        loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  # --- Close (?C) ---
-
-  defp dispatch(socket, state, ?C, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, <<kind, rest::binary>>} ->
-        {name, _} = read_cstring(rest)
-        state = case kind do
-          ?S -> %{state | stmts: Map.delete(state.stmts, name)}
-          ?P -> %{state | portals: Map.delete(state.portals, name)}
-          _ -> state
-        end
-        :gen_tcp.send(socket, <<"3", 4::32>>)
-        loop(socket, state)
-      {:ok, _} ->
-        :gen_tcp.send(socket, <<"3", 4::32>>)
-        loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  # --- Flush (?H) ---
-
-  defp dispatch(socket, state, ?H, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, _} -> loop(socket, state)
-      :error -> :ok
-    end
-  end
-
-  # --- Unknown messages ---
-
-  defp dispatch(socket, state, _type, body_len) do
-    case recv_body(socket, body_len) do
-      {:ok, _} -> loop(socket, state)
-      :error -> :ok
-    end
-  end
 
   # Safe recv that handles errors instead of crashing
   defp recv_body(_socket, 0), do: {:ok, <<>>}
@@ -426,7 +213,8 @@ defmodule Wire.Connection do
 
   # Error sync: skip everything except Sync on wake path too
   defp dispatch_with_body(socket, %{error_sync: true} = state, ?S, _body) do
-    state = %{state | error_sync: false}
+    # Sync resets error state and cleans up unnamed portal
+    state = %{state | error_sync: false, portals: Map.delete(state.portals, "")}
     :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
     loop(socket, state)
   end
@@ -454,15 +242,20 @@ defmodule Wire.Connection do
     {query_sql, rest} = read_cstring(rest)
     {param_oids, _rest} = parse_param_oids(rest)
 
-    if stmt_name != "" and Map.has_key?(state.stmts, stmt_name) do
-      state = handle_extended_error(socket, "42P05",
-        "prepared statement \"#{stmt_name}\" already exists", state)
-      loop(socket, state)
-    else
-      entry = %{sql: query_sql, param_oids: param_oids}
-      state = put_in(state, [:stmts, stmt_name], entry)
-      :gen_tcp.send(socket, <<"1", 4::32>>)
-      loop(socket, state)
+    cond do
+      stmt_name != "" and Map.has_key?(state.stmts, stmt_name) ->
+        state = handle_extended_error(socket, "42P05",
+          "prepared statement \"#{stmt_name}\" already exists", state)
+        loop(socket, state)
+      stmt_name != "" and map_size(state.stmts) >= 1024 ->
+        state = handle_extended_error(socket, "53000",
+          "too many prepared statements", state)
+        loop(socket, state)
+      true ->
+        entry = %{sql: query_sql, param_oids: param_oids}
+        state = put_in(state, [:stmts, stmt_name], entry)
+        :gen_tcp.send(socket, <<"1", 4::32>>)
+        loop(socket, state)
     end
   end
 
@@ -556,7 +349,8 @@ defmodule Wire.Connection do
   end
 
   defp dispatch_with_body(socket, state, ?S, _body) do
-    state = %{state | error_sync: false}
+    # Sync resets error state and cleans up unnamed portal
+    state = %{state | error_sync: false, portals: Map.delete(state.portals, "")}
     :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
     loop(socket, state)
   end
@@ -629,7 +423,13 @@ defmodule Wire.Connection do
       placeholder = "$#{idx}"
       replacement = case val do
         nil -> "NULL"
-        v when is_binary(v) -> "'#{String.replace(v, "'", "''")}'"
+        v when is_binary(v) ->
+          # Strip NUL bytes, escape backslashes and single quotes
+          cleaned = v
+            |> String.replace(<<0>>, "")
+            |> String.replace("\\", "\\\\")
+            |> String.replace("'", "''")
+          "'#{cleaned}'"
         v -> to_string(v)
       end
       String.replace(acc, placeholder, replacement)
@@ -643,28 +443,16 @@ defmodule Wire.Connection do
     :gen_tcp.send(socket, <<"t", byte_size(payload) + 4::32, payload::binary>>)
   end
 
-  defp describe_statement_result(socket, sql) do
-    # Try to determine if this is a SELECT-like query that returns rows
-    normalized = sql |> String.downcase() |> String.trim() |> String.trim_trailing(";") |> String.trim()
-    if String.starts_with?(normalized, "select") or String.starts_with?(normalized, "with") do
-      # Try to get column info — but for statements with params we can't run yet
-      # Send NoData for safety; drivers will get RowDescription from portal Describe
-      :gen_tcp.send(socket, <<"n", 4::32>>)
-    else
-      :gen_tcp.send(socket, <<"n", 4::32>>)
-    end
+  # Describe for both statements and portals sends NoData.
+  # NEVER execute queries during Describe — a DELETE portal Describe
+  # would execute the deletion. Drivers get RowDescription from the
+  # actual Execute response instead.
+  defp describe_statement_result(socket, _sql) do
+    :gen_tcp.send(socket, <<"n", 4::32>>)
   end
 
-  defp describe_portal_result(socket, sql) do
-    # Portal has bound SQL, so we can try to determine result columns
-    case run_query(sql) do
-      {:rows, cols, _rows, _tag} ->
-        :gen_tcp.send(socket, encode_row_desc(cols))
-      {:command, _tag} ->
-        :gen_tcp.send(socket, <<"n", 4::32>>)
-      {:error, _msg} ->
-        :gen_tcp.send(socket, <<"n", 4::32>>)
-    end
+  defp describe_portal_result(socket, _sql) do
+    :gen_tcp.send(socket, <<"n", 4::32>>)
   end
 
   defp handle_extended_error(socket, code, msg, state) do
