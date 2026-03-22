@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Runtime values for SQL expressions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// PartialEq, Eq, and Hash are manually implemented to satisfy HashMap's
+/// contract for Float values: NaN == NaN (for GROUP BY grouping, matching
+/// PostgreSQL behavior) and +0.0 == -0.0 (IEEE 754 equality).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -9,6 +13,26 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bytea(Vec<u8>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => {
+                if a.is_nan() && b.is_nan() {
+                    true // NaN groups with NaN in GROUP BY (PostgreSQL behavior)
+                } else {
+                    a == b // IEEE 754: +0.0 == -0.0
+                }
+            }
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Bytea(a), Value::Bytea(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Eq for Value {}
@@ -20,7 +44,17 @@ impl std::hash::Hash for Value {
             Value::Null => {}
             Value::Bool(b) => b.hash(state),
             Value::Int(i) => i.hash(state),
-            Value::Float(f) => f.to_bits().hash(state),
+            Value::Float(f) => {
+                if f.is_nan() {
+                    // All NaN bit patterns hash identically
+                    f64::NAN.to_bits().hash(state);
+                } else if *f == 0.0 {
+                    // Canonicalize +0.0 and -0.0 to match PartialEq
+                    0.0f64.to_bits().hash(state);
+                } else {
+                    f.to_bits().hash(state);
+                }
+            }
             Value::Text(s) => s.hash(state),
             Value::Bytea(b) => b.hash(state),
         }
