@@ -1156,23 +1156,22 @@ fn exec_select_aggregate(
 ) -> Result<QueryResult, String> {
     let group_col_indices = resolve_group_columns(&select.group_clause, table)?;
 
-    // Group rows (use Vec to maintain insertion order)
+    // Group rows (use Vec to maintain insertion order, HashMap for O(1) lookup)
     let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
-    let mut group_index: HashMap<String, usize> = HashMap::new();
+    let mut group_index: HashMap<Vec<Value>, usize> = HashMap::new();
 
     if group_col_indices.is_empty() {
         groups.push((vec![], rows));
     } else {
         for row in rows {
             let key: Vec<Value> = group_col_indices.iter().map(|&i| row[i].clone()).collect();
-            let key_str = format!("{:?}", key);
 
-            if let Some(&idx) = group_index.get(&key_str) {
+            if let Some(&idx) = group_index.get(&key) {
                 groups[idx].1.push(row);
             } else {
                 let idx = groups.len();
-                group_index.insert(key_str, idx);
-                groups.push((key.clone(), vec![row]));
+                group_index.insert(key.clone(), idx);
+                groups.push((key, vec![row]));
             }
         }
     }

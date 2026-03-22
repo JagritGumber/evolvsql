@@ -11,6 +11,22 @@ pub enum Value {
     Bytea(Vec<u8>),
 }
 
+impl Eq for Value {}
+
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Int(i) => i.hash(state),
+            Value::Float(f) => f.to_bits().hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Bytea(b) => b.hash(state),
+        }
+    }
+}
+
 impl Value {
     pub fn compare(&self, other: &Value) -> Option<std::cmp::Ordering> {
         match (self, other) {

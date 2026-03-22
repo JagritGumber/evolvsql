@@ -3,7 +3,12 @@ defmodule Wire.Connection do
   require Logger
 
   def start(socket) do
-    pid = spawn_link(fn -> handshake(socket) end)
+    pid = spawn_opt(fn -> handshake(socket) end, [
+      :link,
+      min_heap_size: 233,
+      min_bin_vheap_size: 46,
+      fullsweep_after: 10
+    ])
     {:ok, pid}
   end
 
@@ -79,6 +84,7 @@ defmodule Wire.Connection do
     case :gen_tcp.recv(socket, 5) do
       {:ok, <<"Q", len::32>>} ->
         simple_query(socket, len - 4)
+        :erlang.garbage_collect()
         loop(socket)
 
       {:ok, <<"X", _::32>>} ->
