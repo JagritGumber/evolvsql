@@ -20,6 +20,7 @@ pub struct QueryResult {
 struct JoinSource {
     alias: String,
     table_name: String,
+    #[allow(dead_code)] // needed for future cross-schema joins
     schema: String,
     table_def: Table,
     col_offset: usize,
@@ -1181,18 +1182,18 @@ fn resolve_targets(
                         } else {
                             // Qualified star: e.g., u.*
                             let qualifier = &string_fields[0];
-                            let src = ctx
-                                .sources
-                                .iter()
-                                .find(|s| {
-                                    s.alias == *qualifier || s.table_name == *qualifier
-                                })
-                                .ok_or_else(|| {
-                                    format!(
-                                        "missing FROM-clause entry for table \"{}\"",
-                                        qualifier
-                                    )
-                                })?;
+                            let matches: Vec<_> = ctx.sources.iter()
+                                .filter(|s| s.alias == *qualifier || s.table_name == *qualifier)
+                                .collect();
+                            let src = match matches.len() {
+                                0 => return Err(format!(
+                                    "missing FROM-clause entry for table \"{}\"", qualifier
+                                )),
+                                1 => matches[0],
+                                _ => return Err(format!(
+                                    "table reference \"{}\" is ambiguous", qualifier
+                                )),
+                            };
                             for (i, col) in src.table_def.columns.iter().enumerate() {
                                 targets.push(SelectTarget::Column {
                                     name: col.name.clone(),
@@ -1614,13 +1615,14 @@ fn compute_aggregate(
                     .first()
                     .and_then(|a| a.node.as_ref())
                     .ok_or("COUNT requires argument")?;
-                let count = rows
-                    .iter()
-                    .filter(|row| {
-                        !matches!(eval_expr(arg, row, ctx), Ok(Value::Null) | Err(_))
-                    })
-                    .count();
-                Ok(Value::Int(count as i64))
+                let mut count: i64 = 0;
+                for row in rows {
+                    match eval_expr(arg, row, ctx)? {
+                        Value::Null => {} // COUNT(col) skips NULLs
+                        _ => count += 1,
+                    }
+                }
+                Ok(Value::Int(count))
             }
         }
         "sum" => {
