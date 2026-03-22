@@ -304,7 +304,6 @@ fn exec_insert(
 // ── Constraint enforcement ────────────────────────────────────────────
 
 fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), String> {
-    // Collect PK column indices for composite PK check
     let pk_cols: Vec<usize> = table
         .columns
         .iter()
@@ -313,7 +312,7 @@ fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), S
         .map(|(i, _)| i)
         .collect();
 
-    // NOT NULL checks
+    // NOT NULL checks (no scan needed)
     for (i, col) in table.columns.iter().enumerate() {
         if !col.nullable && matches!(row[i], Value::Null) {
             return Err(format!(
@@ -323,9 +322,21 @@ fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), S
         }
     }
 
-    // Composite PK check (if multiple PK columns)
+    // Check if any uniqueness checks are needed before scanning
+    let needs_unique_check = pk_cols.len() > 1
+        || table.columns.iter().enumerate().any(|(_, c)| {
+            (c.primary_key || c.unique)
+        });
+
+    if !needs_unique_check {
+        return Ok(());
+    }
+
+    // Scan existing rows ONCE for all constraint checks
+    let existing = storage::scan(schema, &table.name)?;
+
+    // Composite PK check
     if pk_cols.len() > 1 {
-        let existing = storage::scan(schema, &table.name)?;
         let new_key: Vec<&Value> = pk_cols.iter().map(|&i| &row[i]).collect();
         for erow in &existing {
             let ekey: Vec<&Value> = pk_cols.iter().map(|&i| &erow[i]).collect();
@@ -341,11 +352,9 @@ fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), S
     // Per-column UNIQUE / single-column PK checks
     for (i, col) in table.columns.iter().enumerate() {
         if (col.primary_key || col.unique) && !matches!(row[i], Value::Null) {
-            // Skip composite PK columns (already checked above)
             if col.primary_key && pk_cols.len() > 1 {
                 continue;
             }
-            let existing = storage::scan(schema, &table.name)?;
             for erow in &existing {
                 if i < erow.len() && erow[i] == row[i] {
                     let cname = if col.primary_key {
@@ -495,7 +504,9 @@ fn eval_a_expr(
             .and_then(|n| n.node.as_ref())
             .ok_or("unary - missing operand")?;
         return match eval_expr(right, row, table)? {
-            Value::Int(n) => Ok(Value::Int(-n)),
+            Value::Int(n) => Ok(Value::Int(
+                n.checked_neg().ok_or("integer out of range")?,
+            )),
             Value::Float(f) => Ok(Value::Float(-f)),
             Value::Null => Ok(Value::Null),
             _ => Err("unary minus requires numeric".into()),
@@ -603,14 +614,22 @@ fn eval_arithmetic(op: &str, left: &Value, right: &Value) -> Result<Value, Strin
     }
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => match op {
-            "+" => Ok(Value::Int(a + b)),
-            "-" => Ok(Value::Int(a - b)),
-            "*" => Ok(Value::Int(a * b)),
+            "+" => Ok(Value::Int(
+                a.checked_add(*b).ok_or("integer out of range")?,
+            )),
+            "-" => Ok(Value::Int(
+                a.checked_sub(*b).ok_or("integer out of range")?,
+            )),
+            "*" => Ok(Value::Int(
+                a.checked_mul(*b).ok_or("integer out of range")?,
+            )),
             "/" => {
                 if *b == 0 {
                     Err("division by zero".into())
                 } else {
-                    Ok(Value::Int(a / b))
+                    Ok(Value::Int(
+                        a.checked_div(*b).ok_or("integer out of range")?,
+                    ))
                 }
             }
             _ => Err(format!("unsupported arithmetic op: {}", op)),
@@ -690,7 +709,9 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Text(parts))
         }
         "abs" => match args.first() {
-            Some(Value::Int(n)) => Ok(Value::Int(n.abs())),
+            Some(Value::Int(n)) => Ok(Value::Int(
+                n.checked_abs().ok_or("integer out of range")?,
+            )),
             Some(Value::Float(f)) => Ok(Value::Float(f.abs())),
             Some(Value::Null) => Ok(Value::Null),
             _ => Err("abs() requires numeric argument".into()),
