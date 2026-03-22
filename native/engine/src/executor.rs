@@ -741,13 +741,17 @@ fn eval_where(
     where_clause: &Option<Box<pg_query::protobuf::Node>>,
     row: &[Value],
     table: &Table,
-) -> bool {
+) -> Result<bool, String> {
     match where_clause {
         Some(wc) => match wc.node.as_ref() {
-            Some(expr) => matches!(eval_expr(expr, row, table), Ok(Value::Bool(true))),
-            None => true,
+            Some(expr) => match eval_expr(expr, row, table)? {
+                Value::Bool(b) => Ok(b),
+                Value::Null => Ok(false), // NULL in WHERE filters out the row
+                _ => Err("WHERE clause must return boolean".into()),
+            },
+            None => Ok(true),
         },
-        None => true,
+        None => Ok(true),
     }
 }
 
@@ -920,11 +924,13 @@ fn exec_select(
 
     let all_rows = storage::scan(&schema, &table_name)?;
 
-    // WHERE filter
-    let mut rows: Vec<Vec<Value>> = all_rows
-        .into_iter()
-        .filter(|row| eval_where(&select.where_clause, row, &table_def))
-        .collect();
+    // WHERE filter (propagates errors instead of silently excluding rows)
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for row in all_rows {
+        if eval_where(&select.where_clause, &row, &table_def)? {
+            rows.push(row);
+        }
+    }
 
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
@@ -1156,23 +1162,22 @@ fn exec_select_aggregate(
 ) -> Result<QueryResult, String> {
     let group_col_indices = resolve_group_columns(&select.group_clause, table)?;
 
-    // Group rows (use Vec to maintain insertion order)
+    // Group rows (use Vec to maintain insertion order, HashMap for O(1) lookup)
     let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
-    let mut group_index: HashMap<String, usize> = HashMap::new();
+    let mut group_index: HashMap<Vec<Value>, usize> = HashMap::new();
 
     if group_col_indices.is_empty() {
         groups.push((vec![], rows));
     } else {
         for row in rows {
             let key: Vec<Value> = group_col_indices.iter().map(|&i| row[i].clone()).collect();
-            let key_str = format!("{:?}", key);
 
-            if let Some(&idx) = group_index.get(&key_str) {
+            if let Some(&idx) = group_index.get(&key) {
                 groups[idx].1.push(row);
             } else {
                 let idx = groups.len();
-                group_index.insert(key_str, idx);
-                groups.push((key.clone(), vec![row]));
+                group_index.insert(key.clone(), idx);
+                groups.push((key, vec![row]));
             }
         }
     }
@@ -1337,7 +1342,7 @@ fn compute_aggregate(
             for row in rows {
                 match eval_expr(arg, row, table)? {
                     Value::Int(n) => {
-                        si += n;
+                        si = si.checked_add(n).ok_or("integer out of range")?;
                         has_val = true;
                     }
                     Value::Float(f) => {
@@ -1557,9 +1562,15 @@ fn exec_delete(
     let count = if delete.where_clause.is_some() {
         let table_def = catalog::get_table(schema, table_name)
             .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+        // Validate WHERE clause first (propagates errors instead of silently excluding rows)
+        let all_rows = storage::scan(schema, table_name)?;
+        for row in &all_rows {
+            eval_where(&delete.where_clause, row, &table_def)?;
+        }
+        // Now execute the delete — safe to unwrap since we validated above
         let wc = delete.where_clause.clone();
         storage::delete_where(schema, table_name, |row| {
-            eval_where(&wc, row, &table_def)
+            eval_where(&wc, row, &table_def).unwrap_or(false)
         })?
     } else {
         storage::delete_all(schema, table_name)?
@@ -1609,6 +1620,12 @@ fn exec_update(
         }
     }
 
+    // Validate WHERE clause against all rows first (error propagation)
+    let all_rows = storage::scan(schema, table_name)?;
+    for row in &all_rows {
+        eval_where(&update.where_clause, row, &table_def)?;
+    }
+
     let wc = update.where_clause.clone();
     let td = table_def.clone();
     let assigns = assignments.clone();
@@ -1616,7 +1633,7 @@ fn exec_update(
     let count = storage::update_rows_checked(
         schema,
         table_name,
-        |row| eval_where(&wc, row, &td),
+        |row| eval_where(&wc, row, &td).unwrap_or(false),
         |row| {
             // Compute new row values, propagating errors
             let mut new_row = row.clone();

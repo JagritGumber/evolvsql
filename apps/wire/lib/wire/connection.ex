@@ -2,15 +2,22 @@ defmodule Wire.Connection do
   @moduledoc "Handles one PostgreSQL client session over the wire protocol v3."
   require Logger
 
+  # Idle connections hibernate after this timeout, freeing their entire heap.
+  @idle_timeout_ms 30_000
+
   def start(socket) do
-    pid = spawn_link(fn -> handshake(socket) end)
+    pid = :erlang.spawn_opt(fn -> handshake(socket) end, [
+      :link,
+      {:min_heap_size, 233},
+      {:min_bin_vheap_size, 46},
+      {:fullsweep_after, 10}
+    ])
     {:ok, pid}
   end
 
   # --- Startup ---
 
   defp handshake(socket) do
-    # Fix #6: Read type+length in one recv instead of two
     with {:ok, <<len::32>>} <- :gen_tcp.recv(socket, 4),
          {:ok, payload} <- :gen_tcp.recv(socket, len - 4) do
       case payload do
@@ -33,7 +40,9 @@ defmodule Wire.Connection do
       end
     else
       {:error, :closed} -> :ok
-      {:error, reason} -> Logger.error("Handshake: #{inspect(reason)}")
+      {:error, reason} ->
+        Logger.error("Handshake: #{inspect(reason)}")
+        :gen_tcp.close(socket)
     end
   end
 
@@ -73,52 +82,199 @@ defmodule Wire.Connection do
   end
 
   # --- Query Loop ---
-  # Fix #6: Read message type + length in one 5-byte recv
 
   defp loop(socket) do
-    case :gen_tcp.recv(socket, 5) do
-      {:ok, <<"Q", len::32>>} ->
-        simple_query(socket, len - 4)
-        loop(socket)
+    case :gen_tcp.recv(socket, 5, @idle_timeout_ms) do
+      {:ok, <<type, len::32>>} ->
+        dispatch(socket, type, len - 4)
 
-      {:ok, <<"X", _::32>>} ->
+      {:error, :timeout} ->
+        enter_hibernate(socket)
+
+      {:error, :closed} ->
+        :ok
+
+      {:error, r} ->
+        Logger.error("Connection: #{inspect(r)}")
         :gen_tcp.close(socket)
-
-      {:ok, <<"P", len::32>>} ->
-        if len > 4, do: :gen_tcp.recv(socket, len - 4)
-        :gen_tcp.send(socket, <<"1", 4::32>>)
-        loop(socket)
-
-      {:ok, <<"B", len::32>>} ->
-        if len > 4, do: :gen_tcp.recv(socket, len - 4)
-        :gen_tcp.send(socket, <<"2", 4::32>>)
-        loop(socket)
-
-      {:ok, <<"S", len::32>>} ->
-        if len > 4, do: :gen_tcp.recv(socket, len - 4)
-        :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
-        loop(socket)
-
-      {:ok, <<_, len::32>>} ->
-        if len > 4, do: :gen_tcp.recv(socket, len - 4)
-        loop(socket)
-
-      {:error, :closed} -> :ok
-      {:error, r} -> Logger.error("Connection: #{inspect(r)}")
     end
   end
 
-  # --- Simple Query ---
+  # Unified message dispatch — used by both normal loop and hibernate wake.
+  # Reads the body from socket, handles the message, returns to loop.
+  defp dispatch(socket, ?Q, body_len) do
+    case recv_body(socket, body_len) do
+      {:ok, data} ->
+        sql = data |> String.trim_trailing(<<0>>) |> String.trim()
+        execute_query(socket, sql)
+        :erlang.garbage_collect()
+        loop(socket)
+      :error -> :ok
+    end
+  end
 
-  defp simple_query(socket, body_len) do
-    {:ok, data} = :gen_tcp.recv(socket, body_len)
-    sql = String.trim_trailing(data, <<0>>)
+  defp dispatch(socket, ?X, _body_len) do
+    :gen_tcp.close(socket)
+  end
 
-    # Fix #5: Remove Logger.debug from hot path
+  defp dispatch(socket, ?P, body_len) do
+    case recv_body(socket, body_len) do
+      {:ok, _} -> :gen_tcp.send(socket, <<"1", 4::32>>); loop(socket)
+      :error -> :ok
+    end
+  end
 
-    case run_query(String.trim(sql)) do
+  defp dispatch(socket, ?B, body_len) do
+    case recv_body(socket, body_len) do
+      {:ok, _} -> :gen_tcp.send(socket, <<"2", 4::32>>); loop(socket)
+      :error -> :ok
+    end
+  end
+
+  defp dispatch(socket, ?S, body_len) do
+    case recv_body(socket, body_len) do
+      {:ok, _} -> :gen_tcp.send(socket, <<"Z", 5::32, "I">>); loop(socket)
+      :error -> :ok
+    end
+  end
+
+  defp dispatch(socket, _type, body_len) do
+    case recv_body(socket, body_len) do
+      {:ok, _} -> loop(socket)
+      :error -> :ok
+    end
+  end
+
+  # Safe recv that handles errors instead of crashing
+  defp recv_body(_socket, 0), do: {:ok, <<>>}
+  defp recv_body(socket, len) do
+    case :gen_tcp.recv(socket, len) do
+      {:ok, data} -> {:ok, data}
+      {:error, :closed} -> :error
+      {:error, r} ->
+        Logger.error("Connection recv: #{inspect(r)}")
+        :gen_tcp.close(socket)
+        :error
+    end
+  end
+
+  # --- Hibernate ---
+
+  defp enter_hibernate(socket) do
+    case :inet.setopts(socket, active: :once) do
+      :ok ->
+        :proc_lib.hibernate(__MODULE__, :__wake__, [socket])
+      {:error, _reason} ->
+        :gen_tcp.close(socket)
+    end
+  end
+
+  @doc false
+  def __wake__(socket) do
+    receive do
+      {:tcp, ^socket, data} ->
+        :inet.setopts(socket, active: false)
+        handle_wake_data(socket, data)
+
+      {:tcp_closed, ^socket} ->
+        :ok
+
+      {:tcp_error, ^socket, reason} ->
+        Logger.warning("Connection: tcp_error during hibernate: #{inspect(reason)}")
+        :gen_tcp.close(socket)
+    after
+      300_000 ->
+        # 5 min safety timeout — prevent zombie processes
+        :gen_tcp.close(socket)
+    end
+  end
+
+  # Reconstruct the 5-byte header from wake data, then feed into
+  # the unified dispatch (which reads the body from socket if needed).
+  defp handle_wake_data(socket, data) when byte_size(data) >= 5 do
+    <<type, len::32, extra::binary>> = data
+    body_len = len - 4
+
+    # Guard against malformed packets where len < 4
+    if body_len < 0 do
+      :gen_tcp.close(socket)
+    else
+      handle_wake_msg(socket, type, body_len, extra)
+    end
+  end
+
+  defp handle_wake_data(socket, partial) when byte_size(partial) < 5 do
+    case :gen_tcp.recv(socket, 5 - byte_size(partial), 30_000) do
+      {:ok, more} -> handle_wake_data(socket, <<partial::binary, more::binary>>)
+      {:error, _} ->
+        :gen_tcp.close(socket)
+    end
+  end
+
+  defp handle_wake_msg(socket, type, body_len, extra) do
+    {body, leftover} = if byte_size(extra) >= body_len do
+      {binary_part(extra, 0, max(body_len, 0)),
+       binary_part(extra, body_len, byte_size(extra) - body_len)}
+    else
+      # Need more bytes from socket
+      remaining = body_len - byte_size(extra)
+      case :gen_tcp.recv(socket, remaining, 30_000) do
+        {:ok, more} -> {<<extra::binary, more::binary>>, <<>>}
+        {:error, _} -> {:error, <<>>}
+      end
+    end
+
+    case body do
+      :error ->
+        :gen_tcp.close(socket)
+      body when is_binary(body) ->
+        dispatch_with_body(socket, type, body)
+        # Handle coalesced messages
+        if byte_size(leftover) > 0 do
+          handle_wake_data(socket, leftover)
+        else
+          :ok  # dispatch_with_body already called loop()
+        end
+    end
+  end
+
+  # Dispatch with body already read (wake path only).
+  # The ?Q case needs special handling since we already have the body.
+  defp dispatch_with_body(socket, ?Q, body) do
+    sql = body |> String.trim_trailing(<<0>>) |> String.trim()
+    execute_query(socket, sql)
+    :erlang.garbage_collect()
+    loop(socket)
+  end
+
+  defp dispatch_with_body(socket, ?X, _body) do
+    :gen_tcp.close(socket)
+  end
+
+  defp dispatch_with_body(socket, ?P, _body) do
+    :gen_tcp.send(socket, <<"1", 4::32>>)
+    loop(socket)
+  end
+
+  defp dispatch_with_body(socket, ?B, _body) do
+    :gen_tcp.send(socket, <<"2", 4::32>>)
+    loop(socket)
+  end
+
+  defp dispatch_with_body(socket, ?S, _body) do
+    :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
+    loop(socket)
+  end
+
+  defp dispatch_with_body(socket, _type, _body) do
+    loop(socket)
+  end
+
+  # --- Query execution + response encoding ---
+
+  defp execute_query(socket, sql) do
+    case run_query(sql) do
       {:rows, cols, rows, tag} ->
-        # Fix #2: Buffer entire response and send in one write
         buf = [
           encode_row_desc(cols),
           Enum.map(rows, &encode_data_row/1),
@@ -128,19 +284,14 @@ defmodule Wire.Connection do
         :gen_tcp.send(socket, buf)
 
       {:command, tag} ->
-        buf = [encode_complete(tag), <<"Z", 5::32, "I">>]
-        :gen_tcp.send(socket, buf)
+        :gen_tcp.send(socket, [encode_complete(tag), <<"Z", 5::32, "I">>])
 
       {:error, msg} ->
-        buf = [encode_error("42601", msg), <<"Z", 5::32, "I">>]
-        :gen_tcp.send(socket, buf)
+        :gen_tcp.send(socket, [encode_error("42601", msg), <<"Z", 5::32, "I">>])
     end
   end
 
-  # --- Query dispatch — routes to Rust engine via NIF ---
-
   defp run_query(sql) do
-    # Fix #6b: Correct normalization order (trim whitespace before trimming semicolon)
     normalized = sql |> String.downcase() |> String.trim() |> String.trim_trailing(";") |> String.trim()
 
     cond do
@@ -155,7 +306,6 @@ defmodule Wire.Connection do
         {:command, "EMPTY"}
 
       true ->
-        # Fix #4: NIF returns native Erlang terms, no JSON round-trip
         case Engine.execute_sql(sql) do
           {:ok, %{tag: tag, columns: columns, rows: rows}} ->
             if columns == [] and rows == [] do
@@ -170,7 +320,7 @@ defmodule Wire.Connection do
     end
   end
 
-  # --- Response Encoding (returns iodata, does NOT send) ---
+  # --- Response Encoding ---
 
   defp encode_row_desc(cols) do
     fields =

@@ -43,6 +43,10 @@ struct Args {
     /// Concurrent benchmark: number of parallel clients
     #[arg(long)]
     clients: Option<u32>,
+
+    /// Memory test: open N connections, run a query, then hold idle
+    #[arg(long)]
+    memtest: Option<u32>,
 }
 
 fn main() {
@@ -61,6 +65,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Memory test mode
+    if let Some(n) = args.memtest {
+        conn.close();
+        run_memtest(&args.host, args.port, &args.user, &args.dbname, &args.password, n);
+        return;
+    }
 
     // Concurrent benchmark mode
     if let (Some(sql), Some(n), Some(clients)) = (&args.c, args.bench, args.clients) {
@@ -321,4 +332,86 @@ fn print_result(result: &wire::QueryResult) {
     }
 
     println!("({} rows)", result.rows.len());
+}
+
+fn get_beam_rss() -> Option<u64> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", "beam.smp"])
+        .output()
+        .ok()?;
+    let pid_str = String::from_utf8_lossy(&output.stdout);
+    let pid = pid_str.trim().lines().next()?.trim();
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if line.starts_with("VmRSS:") {
+            let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+            return Some(kb);
+        }
+    }
+    None
+}
+
+fn run_memtest(
+    host: &str, port: u16, user: &str, dbname: &str, password: &str,
+    n_clients: u32,
+) {
+    let rss0 = get_beam_rss().unwrap_or(0);
+    println!("=== Memory Test: {} connections ===", n_clients);
+    println!("BASELINE:    {} KB RSS", rss0);
+
+    // Open N connections
+    let mut conns = Vec::new();
+    for i in 0..n_clients {
+        match wire::Connection::connect(host, port, user, dbname, password) {
+            Ok(c) => conns.push(c),
+            Err(e) => {
+                eprintln!("  conn {} failed: {}", i, e);
+                break;
+            }
+        }
+    }
+    println!("  {} connections opened", conns.len());
+
+    // Run a query on each
+    for conn in &mut conns {
+        let _ = conn.query("SELECT 1;");
+    }
+    println!("  All queried (SELECT 1)");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let rss1 = get_beam_rss().unwrap_or(0);
+    let per_active = if conns.len() > 0 { (rss1.saturating_sub(rss0)) * 1024 / conns.len() as u64 } else { 0 };
+    println!("ACTIVE:      {} KB RSS (+{} KB, ~{} bytes/conn)", rss1, rss1.saturating_sub(rss0), per_active);
+
+    // Wait for hibernate
+    println!("  Waiting 10s for hibernate...");
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
+    let rss2 = get_beam_rss().unwrap_or(0);
+    let freed = rss1.saturating_sub(rss2);
+    let per_hib = if conns.len() > 0 { (rss2.saturating_sub(rss0)) * 1024 / conns.len() as u64 } else { 0 };
+    println!("HIBERNATED:  {} KB RSS (freed {} KB, ~{} bytes/conn)", rss2, freed, per_hib);
+
+    // Wake them all up
+    for conn in &mut conns {
+        let _ = conn.query("SELECT 1;");
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let rss3 = get_beam_rss().unwrap_or(0);
+    println!("WOKEN:       {} KB RSS (all re-queried)", rss3);
+
+    // Close all
+    for mut conn in conns {
+        conn.close();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let rss4 = get_beam_rss().unwrap_or(0);
+    println!("CLOSED:      {} KB RSS (residual +{} KB)", rss4, rss4.saturating_sub(rss0));
+
+    println!();
+    println!("=== SUMMARY ===");
+    println!("  Baseline:      {} KB", rss0);
+    println!("  {} active:     {} KB (+{} KB)", n_clients, rss1, rss1.saturating_sub(rss0));
+    println!("  {} hibernated: {} KB (freed {} KB)", n_clients, rss2, freed);
+    println!("  After close:   {} KB", rss4);
 }

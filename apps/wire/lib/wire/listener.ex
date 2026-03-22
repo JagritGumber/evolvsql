@@ -16,10 +16,10 @@ defmodule Wire.Listener do
       active: false,
       reuseaddr: true,
       nodelay: true,
-      backlog: 1024,
-      sndbuf: 65536,
-      recbuf: 65536,
-      buffer: 65536
+      backlog: 128,
+      buffer: 8192
+      # sndbuf/recbuf omitted — let kernel auto-tune
+      # PG wire protocol messages are typically < 8KB
     ]
 
     case :gen_tcp.listen(port, tcp_opts) do
