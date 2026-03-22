@@ -92,6 +92,16 @@ defmodule Wire.Connection do
   # --- Query Loop ---
 
   defp loop(socket, state) do
+    # Drain any pending data stashed by wake path (coalesced TCP messages)
+    case Map.pop(state, :pending_data, nil) do
+      {nil, _state} ->
+        loop_recv(socket, state)
+      {data, state} ->
+        handle_wake_data(socket, state, data)
+    end
+  end
+
+  defp loop_recv(socket, state) do
     case :gen_tcp.recv(socket, 5, @idle_timeout_ms) do
       {:ok, <<type, len::32>>} ->
         dispatch(socket, state, type, len - 4)
@@ -204,12 +214,14 @@ defmodule Wire.Connection do
       :error ->
         :gen_tcp.close(socket)
       body when is_binary(body) ->
-        dispatch_with_body(socket, state, type, body)
-        if byte_size(leftover) > 0 do
-          handle_wake_data(socket, state, leftover)
+        # Stash leftover into state so loop/2 drains it on next iteration.
+        # dispatch_with_body tail-calls loop(), which checks :pending_data first.
+        state = if byte_size(leftover) > 0 do
+          Map.put(state, :pending_data, leftover)
         else
-          :ok
+          state
         end
+        dispatch_with_body(socket, state, type, body)
     end
   end
 
@@ -428,8 +440,12 @@ defmodule Wire.Connection do
   # if a parameter value itself contains "$2" — the second pass would
   # substitute inside the already-replaced value.
   defp substitute_params(sql, params) do
-    Regex.replace(~r/\$(\d+)/, sql, fn _match, idx_str ->
+    Regex.replace(~r/\$(\d+)/, sql, fn full_match, idx_str ->
       idx = String.to_integer(idx_str)
+      # $0 and out-of-range indices are left as literal text
+      if idx < 1 or idx > length(params) do
+        full_match
+      else
       case Enum.at(params, idx - 1) do
         nil -> "NULL"
         v when is_binary(v) ->
@@ -439,6 +455,7 @@ defmodule Wire.Connection do
             |> String.replace("'", "''")
           "'#{cleaned}'"
         v -> to_string(v)
+      end
       end
     end)
   end
