@@ -10,7 +10,17 @@ defmodule Wire.Listener do
   def init(opts) do
     port = Keyword.get(opts, :port, 5433)
 
-    tcp_opts = [:binary, packet: :raw, active: false, reuseaddr: true, backlog: 1024]
+    tcp_opts = [
+      :binary,
+      packet: :raw,
+      active: false,
+      reuseaddr: true,
+      nodelay: true,
+      backlog: 1024,
+      sndbuf: 65536,
+      recbuf: 65536,
+      buffer: 65536
+    ]
 
     case :gen_tcp.listen(port, tcp_opts) do
       {:ok, socket} ->

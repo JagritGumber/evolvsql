@@ -1,0 +1,17 @@
+[package]
+name = "pgrx-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pgrx"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+rand = "0.9"

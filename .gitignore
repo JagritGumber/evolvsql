@@ -7,7 +7,7 @@
 erl_crash.dump
 
 # Rust
-native/engine/target/
+native/*/target/
 
 # Compiled NIFs
 priv/native/
