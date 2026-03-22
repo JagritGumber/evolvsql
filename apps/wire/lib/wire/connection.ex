@@ -235,6 +235,10 @@ defmodule Wire.Connection do
     loop(socket, state)
   end
 
+  defp dispatch_with_body(socket, %{error_sync: true} = _state, ?X, _body) do
+    :gen_tcp.close(socket)
+  end
+
   defp dispatch_with_body(socket, %{error_sync: true} = state, _type, _body) do
     loop(socket, state)
   end
@@ -344,9 +348,10 @@ defmodule Wire.Connection do
 
       {:ok, portal} ->
         case run_query(portal.sql) do
-          {:rows, cols, rows, tag} ->
+          {:rows, _cols, rows, tag} ->
+            # Extended query: Execute sends DataRow + CommandComplete only.
+            # RowDescription comes from Describe, not Execute.
             buf = [
-              encode_row_desc(cols),
               Enum.map(rows, &encode_data_row/1),
               encode_complete(tag)
             ]
@@ -449,9 +454,11 @@ defmodule Wire.Connection do
       case Enum.at(params, idx - 1) do
         nil -> "NULL"
         v when is_binary(v) ->
+          # With standard_conforming_strings=on (which we advertise),
+          # backslashes are literal — only single quotes need escaping.
+          # NUL bytes stripped as they're invalid in PG string literals.
           cleaned = v
             |> String.replace(<<0>>, "")
-            |> String.replace("\\", "\\\\")
             |> String.replace("'", "''")
           "'#{cleaned}'"
         v -> to_string(v)
