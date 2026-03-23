@@ -537,11 +537,20 @@ fn exec_insert(
     if let NodeEnum::SelectStmt(sel) = select {
         for values_list in &sel.values_lists {
             if let Some(NodeEnum::List(list)) = values_list.node.as_ref() {
+                // Only apply defaults for columns NOT explicitly specified.
+                // This avoids wasting sequence values on SERIAL columns
+                // when the user provides an explicit value.
                 let mut row: Vec<Value> = table_def
                     .columns
                     .iter()
-                    .map(|col| apply_default(&col.default_expr, schema))
-                    .collect();
+                    .map(|col| {
+                        if target_cols.contains(&col.name) {
+                            Ok(Value::Null) // will be overwritten by explicit value below
+                        } else {
+                            apply_default(&col.default_expr, schema)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 for (i, val_node) in list.items.iter().enumerate() {
                     if i >= target_cols.len() {
@@ -580,22 +589,15 @@ fn exec_insert(
 
 // ── DEFAULT value application ─────────────────────────────────────────
 
-fn apply_default(default_expr: &Option<catalog::DefaultExpr>, schema: &str) -> Value {
+fn apply_default(default_expr: &Option<catalog::DefaultExpr>, schema: &str) -> Result<Value, String> {
     match default_expr {
-        Some(catalog::DefaultExpr::Literal(v)) => v.clone(),
+        Some(catalog::DefaultExpr::Literal(v)) => Ok(v.clone()),
         Some(catalog::DefaultExpr::NextVal(seq_fqn)) => {
-            // seq_fqn is "schema.seqname"
-            let parts: Vec<&str> = seq_fqn.splitn(2, '.').collect();
-            let (seq_schema, seq_name) = if parts.len() == 2 {
-                (parts[0], parts[1])
-            } else {
-                (schema, seq_fqn.as_str())
-            };
-            crate::sequence::nextval(seq_schema, seq_name)
-                .map(Value::Int)
-                .unwrap_or(Value::Null)
+            let (seq_schema, seq_name) = parse_seq_name(seq_fqn);
+            let val = crate::sequence::nextval(seq_schema, seq_name)?;
+            Ok(Value::Int(val))
         }
-        None => Value::Null,
+        None => Ok(Value::Null),
     }
 }
 
@@ -985,6 +987,14 @@ fn eval_func_call(
     eval_scalar_function(&name, &args)
 }
 
+/// Parse a sequence name that may be schema-qualified ("public.myseq" or just "myseq").
+fn parse_seq_name(s: &str) -> (&str, &str) {
+    match s.split_once('.') {
+        Some((schema, name)) => (schema, name),
+        None => ("public", s),
+    }
+}
+
 fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "upper" => match args.first() {
@@ -1022,7 +1032,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
         },
         "nextval" => match args.first() {
             Some(Value::Text(s)) => {
-                let val = crate::sequence::nextval("public", s)?;
+                let (schema, name) = parse_seq_name(s);
+                let val = crate::sequence::nextval(schema, name)?;
                 Ok(Value::Int(val))
             }
             Some(Value::Null) => Ok(Value::Null),
@@ -1030,7 +1041,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
         },
         "currval" => match args.first() {
             Some(Value::Text(s)) => {
-                let val = crate::sequence::currval("public", s)?;
+                let (schema, name) = parse_seq_name(s);
+                let val = crate::sequence::currval(schema, name)?;
                 Ok(Value::Int(val))
             }
             Some(Value::Null) => Ok(Value::Null),
@@ -1038,7 +1050,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
         },
         "setval" => match (args.first(), args.get(1)) {
             (Some(Value::Text(s)), Some(Value::Int(v))) => {
-                let val = crate::sequence::setval("public", s, *v)?;
+                let (schema, name) = parse_seq_name(s);
+                let val = crate::sequence::setval(schema, name, *v)?;
                 Ok(Value::Int(val))
             }
             _ => Err("setval() requires (text, integer) arguments".into()),
