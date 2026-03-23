@@ -1,0 +1,19 @@
+## Minimal memory footprint for pgrx
+
+## 2 normal schedulers, 2 dirty CPU, 1 dirty IO
++S 2:2
++SDcpu 2:2
++SDio 1
+
+## Disable busy-wait (saves CPU + reduces allocator pressure)
++sbwt none
++sbwtdcpu none
++sbwtdio none
++swt very_low
+
+## Memory allocator tuning
++MBas aobf
++MHas aobf
+
+## Kernel poll
++K true
