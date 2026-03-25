@@ -1239,13 +1239,12 @@ fn eval_a_expr(
             return match (&left, &right) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    let dist: f32 = a
-                        .iter()
-                        .zip(b.iter())
-                        .map(|(x, y)| (x - y) * (x - y))
-                        .sum::<f32>()
-                        .sqrt();
-                    Ok(Value::Float(dist as f64))
+                    // Single-pass sum-of-squared-differences — no intermediate
+                    // allocation, no branches in inner loop → SIMD-friendly.
+                    let dist_sq: f32 = a.iter().zip(b.iter())
+                        .map(|(x, y)| { let d = x - y; d * d })
+                        .sum();
+                    Ok(Value::Float(dist_sq.sqrt() as f64))
                 }
                 (Value::Vector(a), Value::Vector(b)) => Err(format!(
                     "different vector dimensions {} and {}",
@@ -1259,10 +1258,13 @@ fn eval_a_expr(
             return match (&left, &right) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-                    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    let denom = norm_a * norm_b;
+                    // Single-pass cosine: dot product + both norms in one
+                    // iteration — 3x fewer passes, no branches → SIMD-friendly.
+                    let (dot, norm_a_sq, norm_b_sq) = a.iter().zip(b.iter())
+                        .fold((0.0f32, 0.0f32, 0.0f32), |(d, na, nb), (x, y)| {
+                            (d + x * y, na + x * x, nb + y * y)
+                        });
+                    let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
                     if denom == 0.0 {
                         Ok(Value::Float(1.0))
                     } else {
@@ -1532,6 +1534,58 @@ fn eval_where(
         },
         None => Ok(true),
     }
+}
+
+// ── Fast equality filter (Principle 4: vectorized WHERE) ─────────────
+
+/// Bypass eval_expr for the most common WHERE pattern: `column = constant`.
+/// Direct column-index comparison with zero AST walking overhead.
+struct FastEqualityFilter {
+    col_idx: usize,
+    value: Value,
+}
+
+impl FastEqualityFilter {
+    #[inline(always)]
+    fn matches(&self, row: &[Value]) -> bool {
+        self.col_idx < row.len() && row[self.col_idx] == self.value
+    }
+}
+
+/// Try to extract a fast equality filter from a WHERE clause.
+/// Returns `None` for anything other than simple `ColumnRef = AConst` patterns,
+/// falling through to the generic eval_where loop.
+fn try_fast_equality_filter(
+    where_clause: &Option<Box<pg_query::protobuf::Node>>,
+    ctx: &JoinContext,
+) -> Option<FastEqualityFilter> {
+    let wc = where_clause.as_ref()?;
+    let node = wc.node.as_ref()?;
+
+    if let NodeEnum::AExpr(expr) = node {
+        // Must be AEXPR_OP with "=" operator
+        let op = extract_op_name(&expr.name).ok()?;
+        if op != "=" { return None; }
+
+        let left = expr.lexpr.as_ref()?.node.as_ref()?;
+        let right = expr.rexpr.as_ref()?.node.as_ref()?;
+
+        // Pattern: ColumnRef = Constant
+        if let NodeEnum::ColumnRef(cref) = left {
+            let col_idx = resolve_column(cref, ctx).ok()?;
+            let value = eval_const(Some(right));
+            if matches!(value, Value::Null) { return None; } // NULL = x is never true
+            return Some(FastEqualityFilter { col_idx, value });
+        }
+        // Pattern: Constant = ColumnRef
+        if let NodeEnum::ColumnRef(cref) = right {
+            let col_idx = resolve_column(cref, ctx).ok()?;
+            let value = eval_const(Some(left));
+            if matches!(value, Value::Null) { return None; }
+            return Some(FastEqualityFilter { col_idx, value });
+        }
+    }
+    None
 }
 
 // ── Helper extractors ─────────────────────────────────────────────────
@@ -2143,11 +2197,23 @@ fn exec_select_raw(
 
             // Filter inside the read lock — clone only matching rows.
             // Uses pooled buffer to avoid per-query Vec allocation (Principle 2).
+            let fast_filter = try_fast_equality_filter(&select.where_clause, &ctx);
             let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
                 let mut filtered = take_row_buf();
-                for row in all_rows {
-                    if eval_where(&select.where_clause, row, &ctx)? {
-                        filtered.push(row.clone());
+                if let Some(ref ff) = fast_filter {
+                    // Fast path: direct column comparison — no eval_expr overhead.
+                    // Principle 4: vectorized WHERE for simple equality.
+                    for row in all_rows {
+                        if ff.matches(row) {
+                            filtered.push(row.clone());
+                        }
+                    }
+                } else {
+                    // General path: full eval_where with AST walking.
+                    for row in all_rows {
+                        if eval_where(&select.where_clause, row, &ctx)? {
+                            filtered.push(row.clone());
+                        }
                     }
                 }
                 Ok(filtered)
