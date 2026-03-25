@@ -23,7 +23,6 @@ pub enum Value {
 // Manual Serialize/Deserialize to handle Arc<str> transparently as String.
 impl Serialize for Value {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStructVariant;
         match self {
             Value::Null => serializer.serialize_unit_variant("Value", 0, "Null"),
             Value::Bool(b) => serializer.serialize_newtype_variant("Value", 1, "Bool", b),
