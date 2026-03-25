@@ -5,6 +5,7 @@
 // TODO(#8): O(N) uniqueness check on INSERT/UPDATE — needs hash indexes on
 //   unique columns for O(1) constraint validation. Phase 2 work (index engine).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -15,6 +16,32 @@ use serde::Serialize;
 use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
+
+// ── Thread-local buffer pool (Principle 2: Buffer Pooling) ────────────
+// NIF calls run on dirty schedulers which are real OS threads,
+// so thread_local works correctly here.
+thread_local! {
+    static ROW_POOL: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::with_capacity(1024));
+}
+
+fn take_row_buf() -> Vec<Vec<Value>> {
+    ROW_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        let mut buf = std::mem::take(&mut *p);
+        buf.clear(); // reset length, keep capacity
+        buf
+    })
+}
+
+fn return_row_buf(mut buf: Vec<Vec<Value>>) {
+    buf.clear();
+    ROW_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if buf.capacity() > p.capacity() {
+            *p = buf; // keep the bigger buffer
+        }
+    });
+}
 
 /// Parse cache: concurrent reads via RwLock, write only on cache miss.
 /// Bounded to MAX_PARSE_CACHE entries — clears on overflow to avoid unbounded heap growth.
@@ -1586,6 +1613,10 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
             };
             let table_def = catalog::get_table(schema, &rv.relname)
                 .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
+            // JOIN path: scan() (clone) is required here because rows must be owned
+            // to combine with rows from other tables in the JOIN. scan_with() would
+            // hold the read lock, preventing concurrent access to other tables and
+            // making multi-table lock acquisition deadlock-prone.
             let rows = storage::scan(schema, &rv.relname)?;
             let ncols = table_def.columns.len();
             let ctx = JoinContext {
@@ -2110,9 +2141,10 @@ fn exec_select_raw(
                 total_columns: ncols,
             };
 
-            // Filter inside the read lock — clone only matching rows
+            // Filter inside the read lock — clone only matching rows.
+            // Uses pooled buffer to avoid per-query Vec allocation (Principle 2).
             let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
-                let mut filtered = Vec::new();
+                let mut filtered = take_row_buf();
                 for row in all_rows {
                     if eval_where(&select.where_clause, row, &ctx)? {
                         filtered.push(row.clone());
@@ -2121,7 +2153,9 @@ fn exec_select_raw(
                 Ok(filtered)
             })?;
 
-            return exec_select_raw_post_filter(select, ctx, rows, 0);
+            let result = exec_select_raw_post_filter(select, ctx, rows, 0);
+            // Note: buffer is consumed by post_filter; it handles return_row_buf.
+            return result;
         }
     }
 
@@ -2169,8 +2203,8 @@ fn exec_select_raw(
         (all_rows, inner_ctx, 0)
     };
 
-    // WHERE filter
-    let mut rows: Vec<Vec<Value>> = Vec::new();
+    // WHERE filter — pooled buffer avoids per-query allocation (Principle 2)
+    let mut rows = take_row_buf();
     for row in eval_rows {
         if eval_where(&select.where_clause, &row, &merged_ctx)? {
             rows.push(row);
@@ -2283,7 +2317,8 @@ fn exec_select_raw_post_filter(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let mut result_rows: Vec<Vec<Value>> = Vec::new();
+    // Projection — pooled buffer for result rows (Principle 2)
+    let mut result_rows = take_row_buf();
     for row in &rows {
         let mut result_row = Vec::new();
         for t in &targets {
@@ -2306,6 +2341,9 @@ fn exec_select_raw_post_filter(
         }
         result_rows.push(result_row);
     }
+
+    // Return the input rows buffer to the pool (consumed, no longer needed)
+    return_row_buf(rows);
 
     Ok((columns, result_rows))
 }
@@ -3011,10 +3049,14 @@ fn exec_delete(
 
     let (count, deleted_rows) = if delete.where_clause.is_some() {
         let ctx = JoinContext::single(schema, table_name, table_def.clone());
-        let all_rows = storage::scan(schema, table_name)?;
-        for row in &all_rows {
-            eval_where(&delete.where_clause, row, &ctx)?;
-        }
+        // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
+        // This catches expression errors (bad column refs, type mismatches) before mutation.
+        storage::scan_with(schema, table_name, |all_rows| {
+            for row in all_rows {
+                eval_where(&delete.where_clause, row, &ctx)?;
+            }
+            Ok(())
+        })?;
         if has_returning {
             let wc = delete.where_clause.clone();
             let rows = storage::delete_where_returning(schema, table_name, |row| {
@@ -3086,11 +3128,14 @@ fn exec_update(
         }
     }
 
-    // Validate WHERE clause against all rows first
-    let all_rows = storage::scan(schema, table_name)?;
-    for row in &all_rows {
-        eval_where(&update.where_clause, row, &ctx)?;
-    }
+    // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
+    // This catches expression errors (bad column refs, type mismatches) before mutation.
+    storage::scan_with(schema, table_name, |all_rows| {
+        for row in all_rows {
+            eval_where(&update.where_clause, row, &ctx)?;
+        }
+        Ok(())
+    })?;
 
     let wc = update.where_clause.clone();
     let td = table_def.clone();
