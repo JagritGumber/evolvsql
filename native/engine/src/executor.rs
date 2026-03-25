@@ -1,11 +1,17 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use parking_lot::RwLock;
 use pg_query::NodeEnum;
 use serde::Serialize;
 
 use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
+
+/// Parse cache: concurrent reads via RwLock, write only on cache miss.
+static PARSE_CACHE: LazyLock<RwLock<HashMap<String, pg_query::protobuf::ParseResult>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
@@ -69,11 +75,28 @@ fn resolve_column(
     cref: &pg_query::protobuf::ColumnRef,
     ctx: &JoinContext,
 ) -> Result<usize, String> {
+    // Fast path: single-source, single-field (most common case)
+    // Avoids Vec allocation from extract_string_fields entirely
+    if ctx.sources.len() == 1 {
+        if let Some(last_field) = cref.fields.last().and_then(|f| f.node.as_ref()) {
+            if let NodeEnum::String(s) = last_field {
+                let src = &ctx.sources[0];
+                if let Some(pos) = src.table_def.columns.iter().position(|c| c.name == s.sval) {
+                    return Ok(src.col_offset + pos);
+                }
+                // For 2-field qualified refs on single source, also fast-path
+                if cref.fields.len() == 2 {
+                    return Err(format!("column \"{}\" does not exist", s.sval));
+                }
+            }
+        }
+    }
+
+    // General path for multi-source (JOINs) and edge cases
     let fields = extract_string_fields(cref);
 
     match fields.len() {
         1 => {
-            // Unqualified: search all sources, error if ambiguous
             let col_name = &fields[0];
             let mut found = Vec::new();
             for src in &ctx.sources {
@@ -152,10 +175,21 @@ fn column_type_oid(idx: usize, ctx: &JoinContext) -> Result<i32, String> {
 }
 
 pub fn execute(sql: &str) -> Result<QueryResult, String> {
-    let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+    let protobuf = {
+        let cache = PARSE_CACHE.read();
+        if let Some(cached) = cache.get(sql) {
+            cached.clone()
+        } else {
+            drop(cache);
+            let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+            let proto = parsed.protobuf;
+            let mut cache = PARSE_CACHE.write();
+            cache.insert(sql.to_string(), proto.clone());
+            proto
+        }
+    };
 
-    let raw_stmt = parsed
-        .protobuf
+    let raw_stmt = protobuf
         .stmts
         .first()
         .ok_or("empty query")?;
@@ -566,6 +600,15 @@ fn exec_insert(
                     row[col_idx] = eval_const(val_node.node.as_ref());
                 }
 
+                // Coerce text values to vector type where the column expects it
+                for (i, col) in table_def.columns.iter().enumerate() {
+                    if col.type_oid == TypeOid::Vector {
+                        if let Value::Text(s) = &row[i] {
+                            row[i] = parse_vector_literal(s.trim())?;
+                        }
+                    }
+                }
+
                 check_not_null(&table_def, &row)?;
                 let (unique_checks, pk_cols) = build_unique_checks(&table_def);
                 if has_returning {
@@ -690,13 +733,43 @@ fn check_unique_against(
 
 // ── Expression evaluation ─────────────────────────────────────────────
 
+fn parse_vector_literal(s: &str) -> Result<Value, String> {
+    if s.len() < 2 || !s.starts_with('[') || !s.ends_with(']') {
+        return Err(format!("malformed vector literal: \"{}\"", s));
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.trim().is_empty() {
+        return Err("vector must have at least 1 dimension".into());
+    }
+    let parts: Vec<f32> = inner
+        .split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<f32>()
+                .map_err(|e| format!("invalid vector element \"{}\": {}", p.trim(), e))
+        })
+        .collect::<Result<_, _>>()?;
+    // Reject NaN and Infinity (matches pgvector behavior)
+    if let Some(bad) = parts.iter().find(|f| !f.is_finite()) {
+        return Err(format!("vector elements must be finite, got {}", bad));
+    }
+    Ok(Value::Vector(parts))
+}
+
 fn eval_const(node: Option<&NodeEnum>) -> Value {
     match node {
         Some(NodeEnum::Integer(i)) => Value::Int(i.ival as i64),
         Some(NodeEnum::Float(f)) => {
             f.fval.parse::<f64>().map(Value::Float).unwrap_or(Value::Null)
         }
-        Some(NodeEnum::String(s)) => Value::Text(s.sval.clone()),
+        Some(NodeEnum::String(s)) => {
+            let trimmed = s.sval.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                parse_vector_literal(trimmed).unwrap_or(Value::Text(s.sval.clone()))
+            } else {
+                Value::Text(s.sval.clone())
+            }
+        }
         Some(NodeEnum::AConst(ac)) => {
             if let Some(val) = &ac.val {
                 match val {
@@ -706,7 +779,14 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
                         .parse::<f64>()
                         .map(Value::Float)
                         .unwrap_or(Value::Null),
-                    pg_query::protobuf::a_const::Val::Sval(s) => Value::Text(s.sval.clone()),
+                    pg_query::protobuf::a_const::Val::Sval(s) => {
+                        let trimmed = s.sval.trim();
+                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                            parse_vector_literal(trimmed).unwrap_or(Value::Text(s.sval.clone()))
+                        } else {
+                            Value::Text(s.sval.clone())
+                        }
+                    }
                     pg_query::protobuf::a_const::Val::Bsval(s) => Value::Text(s.bsval.clone()),
                     pg_query::protobuf::a_const::Val::Boolval(b) => Value::Bool(b.boolval),
                 }
@@ -748,7 +828,14 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                         .parse::<f64>()
                         .map(Value::Float)
                         .map_err(|e| e.to_string()),
-                    pg_query::protobuf::a_const::Val::Sval(s) => Ok(Value::Text(s.sval.clone())),
+                    pg_query::protobuf::a_const::Val::Sval(s) => {
+                        let trimmed = s.sval.trim();
+                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                            parse_vector_literal(trimmed)
+                        } else {
+                            Ok(Value::Text(s.sval.clone()))
+                        }
+                    }
                     pg_query::protobuf::a_const::Val::Bsval(s) => Ok(Value::Text(s.bsval.clone())),
                     pg_query::protobuf::a_const::Val::Boolval(b) => Ok(Value::Bool(b.boolval)),
                 }
@@ -762,14 +849,46 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
             .parse::<f64>()
             .map(Value::Float)
             .map_err(|e| e.to_string()),
-        NodeEnum::String(s) => Ok(Value::Text(s.sval.clone())),
+        NodeEnum::String(s) => {
+            let trimmed = s.sval.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                parse_vector_literal(trimmed)
+            } else {
+                Ok(Value::Text(s.sval.clone()))
+            }
+        }
         NodeEnum::TypeCast(tc) => {
             let inner = tc
                 .arg
                 .as_ref()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("TypeCast missing arg")?;
-            eval_expr(inner, row, ctx)
+            let val = eval_expr(inner, row, ctx)?;
+            // Handle cast to vector type
+            if let Some(tn) = &tc.type_name {
+                let type_name: String = tn
+                    .names
+                    .iter()
+                    .filter_map(|n| n.node.as_ref())
+                    .filter_map(|node| {
+                        if let NodeEnum::String(s) = node {
+                            Some(s.sval.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .last()
+                    .unwrap_or_default();
+                if type_name == "vector" {
+                    if let Value::Text(s) = &val {
+                        let trimmed = s.trim();
+                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                            return parse_vector_literal(trimmed);
+                        }
+                    }
+                }
+            }
+            Ok(val)
         }
         NodeEnum::AExpr(expr) => eval_a_expr(expr, row, ctx),
         NodeEnum::BoolExpr(bexpr) => eval_bool_expr(bexpr, row, ctx),
@@ -1050,6 +1169,68 @@ fn eval_a_expr(
         return eval_arithmetic(&op, &left, &right);
     }
 
+    // Vector distance operators (return Float, not Bool — no NULL propagation needed here)
+    match op.as_str() {
+        "<->" => {
+            return match (&left, &right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
+                    let dist: f32 = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| (x - y) * (x - y))
+                        .sum::<f32>()
+                        .sqrt();
+                    Ok(Value::Float(dist as f64))
+                }
+                (Value::Vector(a), Value::Vector(b)) => Err(format!(
+                    "different vector dimensions {} and {}",
+                    a.len(),
+                    b.len()
+                )),
+                _ => Err("operator <-> requires vector operands".into()),
+            };
+        }
+        "<=>" => {
+            return match (&left, &right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
+                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let denom = norm_a * norm_b;
+                    if denom == 0.0 {
+                        Ok(Value::Float(1.0))
+                    } else {
+                        Ok(Value::Float((1.0 - dot / denom) as f64))
+                    }
+                }
+                (Value::Vector(a), Value::Vector(b)) => Err(format!(
+                    "different vector dimensions {} and {}",
+                    a.len(),
+                    b.len()
+                )),
+                _ => Err("operator <=> requires vector operands".into()),
+            };
+        }
+        "<#>" => {
+            return match (&left, &right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
+                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                    Ok(Value::Float((-dot) as f64))
+                }
+                (Value::Vector(a), Value::Vector(b)) => Err(format!(
+                    "different vector dimensions {} and {}",
+                    a.len(),
+                    b.len()
+                )),
+                _ => Err("operator <#> requires vector operands".into()),
+            };
+        }
+        _ => {}
+    }
+
     // NULL propagation for comparisons
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(Value::Null);
@@ -1194,6 +1375,7 @@ fn parse_text_to_value(s: &str, oid: i32) -> Value {
         16 => Value::Bool(s == "t" || s == "true"),
         20 | 21 | 23 => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(s.into())),
         700 | 701 | 1700 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s.into())),
+        16385 => parse_vector_literal(s).unwrap_or(Value::Text(s.into())),
         _ => Value::Text(s.into()),
     }
 }
@@ -1418,15 +1600,18 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
 
             let quals = je.quals.as_ref().and_then(|n| n.node.as_ref());
 
-            let result = nested_loop_join(
-                &left_rows,
-                &right_rows,
-                je.jointype,
-                quals,
-                &merged,
-                left_width,
-                right_width,
-            )?;
+            // MySQL-style: hash join for equi-joins, nested loop for theta/cross.
+            let result = match try_equi_hash_join(
+                &left_rows, &right_rows, je.jointype,
+                quals, &merged, left_width, right_width,
+            ) {
+                Some(Ok(rows)) => rows,
+                Some(Err(e)) => return Err(e),
+                None => nested_loop_join(
+                    &left_rows, &right_rows, je.jointype,
+                    quals, &merged, left_width, right_width,
+                )?,
+            };
 
             Ok((result, merged))
         }
@@ -1482,6 +1667,155 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
         }
         _ => Err("unsupported FROM clause node".into()),
     }
+}
+
+/// Try to execute an equi-join as a hash join (O(N+M)).
+/// Returns None if the ON clause isn't a simple equi-join.
+/// Returns Some(Ok(rows)) on success, Some(Err) on execution error.
+fn try_equi_hash_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    join_type: i32,
+    quals: Option<&NodeEnum>,
+    ctx: &JoinContext,
+    left_width: usize,
+    right_width: usize,
+) -> Option<Result<Vec<Vec<Value>>, String>> {
+    // Extract equi-join key columns from the ON clause
+    let quals = quals?;
+    let (left_col, right_col) = extract_equi_cols(quals, ctx)?;
+
+    Some(execute_hash_join(
+        left_rows, right_rows, join_type, ctx,
+        left_width, right_width, left_col, right_col,
+    ))
+}
+
+/// Extract the column indices for a simple equi-join: ON a.x = b.y
+fn extract_equi_cols(quals: &NodeEnum, ctx: &JoinContext) -> Option<(usize, usize)> {
+    match quals {
+        NodeEnum::AExpr(expr) => {
+            let op = expr.name.iter()
+                .filter_map(|n| n.node.as_ref())
+                .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
+                .next()?;
+            if op != "=" { return None; }
+
+            let left_node = expr.lexpr.as_ref()?.node.as_ref()?;
+            let right_node = expr.rexpr.as_ref()?.node.as_ref()?;
+
+            if let (NodeEnum::ColumnRef(lcref), NodeEnum::ColumnRef(rcref)) = (left_node, right_node) {
+                let li = resolve_column(lcref, ctx).ok()?;
+                let ri = resolve_column(rcref, ctx).ok()?;
+                Some((li, ri))
+            } else {
+                None
+            }
+        }
+        // AND: take the first equality condition
+        NodeEnum::BoolExpr(be) if be.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            for arg in &be.args {
+                if let Some(result) = arg.node.as_ref().and_then(|n| extract_equi_cols(n, ctx)) {
+                    return Some(result);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Hash join: build hash table on right side, probe with left side. O(N+M).
+fn execute_hash_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    join_type: i32,
+    ctx: &JoinContext,
+    left_width: usize,
+    right_width: usize,
+    left_key_col: usize,
+    right_key_col: usize,
+) -> Result<Vec<Vec<Value>>, String> {
+    let null_right = vec![Value::Null; right_width];
+    let null_left = vec![Value::Null; left_width];
+
+    let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
+        || join_type == pg_query::protobuf::JoinType::Undefined as i32;
+    let is_left = join_type == pg_query::protobuf::JoinType::JoinLeft as i32;
+    let is_right = join_type == pg_query::protobuf::JoinType::JoinRight as i32;
+    let is_full = join_type == pg_query::protobuf::JoinType::JoinFull as i32;
+
+    if !is_inner && !is_left && !is_right && !is_full {
+        return Err(format!("unsupported JOIN type: {}", join_type));
+    }
+
+    // Ensure left_key is in [0..left_width) and right_key is in [left_width..)
+    // The ON clause might have them in either order.
+    let (left_key_col, right_key_col) = if left_key_col < left_width && right_key_col >= left_width {
+        (left_key_col, right_key_col)
+    } else if right_key_col < left_width && left_key_col >= left_width {
+        (right_key_col, left_key_col) // swap
+    } else {
+        // Both on same side — can't hash join this, fall back
+        return nested_loop_join(left_rows, right_rows, join_type, None, ctx, left_width, right_width);
+    };
+    let right_local_key = right_key_col - left_width;
+
+    // BUILD phase: hash table on right side, keyed by join column value
+    let mut hash_table: HashMap<Value, Vec<usize>> = HashMap::new();
+    for (i, row) in right_rows.iter().enumerate() {
+        if right_local_key < row.len() {
+            let key = row[right_local_key].clone();
+            hash_table.entry(key).or_default().push(i);
+        }
+    }
+
+    let mut result = Vec::with_capacity(left_rows.len());
+    let mut right_matched = if is_right || is_full {
+        vec![false; right_rows.len()]
+    } else {
+        Vec::new()
+    };
+
+    // PROBE phase: for each left row, look up matching right rows in O(1)
+    for left in left_rows {
+        if left_key_col >= left.len() { continue; }
+        let key = &left[left_key_col];
+        let mut left_matched = false;
+
+        if let Some(indices) = hash_table.get(key) {
+            for &ri in indices {
+                left_matched = true;
+                if !right_matched.is_empty() {
+                    right_matched[ri] = true;
+                }
+                let mut combined = Vec::with_capacity(left_width + right_width);
+                combined.extend_from_slice(left);
+                combined.extend_from_slice(&right_rows[ri]);
+                result.push(combined);
+            }
+        }
+
+        // LEFT/FULL: emit unmatched left row with NULLs
+        if !left_matched && (is_left || is_full) {
+            let mut row = left.clone();
+            row.extend_from_slice(&null_right);
+            result.push(row);
+        }
+    }
+
+    // RIGHT/FULL: emit unmatched right rows
+    if is_right || is_full {
+        for (ri, right) in right_rows.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut row = null_left.clone();
+                row.extend_from_slice(right);
+                result.push(row);
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 fn nested_loop_join(
@@ -1701,7 +2035,45 @@ fn exec_select_raw(
         return exec_select_raw_no_from(select, outer);
     }
 
-    // Execute FROM clause (handles single table, JOINs, and implicit joins)
+    // Fast path: single-table query with no outer context — use scan_with
+    // to filter inside the lock and clone only matching rows.
+    if select.from_clause.len() == 1 && outer.is_none() {
+        if let Some(NodeEnum::RangeVar(rv)) = select.from_clause[0].node.as_ref() {
+            let schema = if rv.schemaname.is_empty() { "public" } else { &rv.schemaname };
+            let table_def = catalog::get_table(schema, &rv.relname)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
+            let alias = rv.alias.as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| rv.relname.clone());
+            let ncols = table_def.columns.len();
+            let ctx = JoinContext {
+                sources: vec![JoinSource {
+                    alias,
+                    table_name: rv.relname.clone(),
+                    #[allow(dead_code)]
+                    schema: schema.to_string(),
+                    table_def,
+                    col_offset: 0,
+                }],
+                total_columns: ncols,
+            };
+
+            // Filter inside the read lock — clone only matching rows
+            let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
+                let mut filtered = Vec::new();
+                for row in all_rows {
+                    if eval_where(&select.where_clause, row, &ctx)? {
+                        filtered.push(row.clone());
+                    }
+                }
+                Ok(filtered)
+            })?;
+
+            return exec_select_raw_post_filter(select, ctx, rows, 0);
+        }
+    }
+
+    // General path: JOINs, implicit joins, subqueries, correlated
     let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause)?;
 
     // If we have an outer context (correlated subquery), merge it
@@ -1753,6 +2125,16 @@ fn exec_select_raw(
         }
     }
 
+    return exec_select_raw_post_filter(select, merged_ctx, rows, outer_width);
+}
+
+/// Shared post-filter logic: aggregates, ORDER BY, LIMIT, projection.
+fn exec_select_raw_post_filter(
+    select: &pg_query::protobuf::SelectStmt,
+    merged_ctx: JoinContext,
+    mut rows: Vec<Vec<Value>>,
+    outer_width: usize,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
         let agg_result = exec_select_aggregate(select, &merged_ctx, rows)?;
@@ -1779,8 +2161,15 @@ fn exec_select_raw(
 
     // ORDER BY (on full rows before projection)
     if !select.sort_clause.is_empty() {
-        let sort_keys = resolve_sort_keys(&select.sort_clause, &merged_ctx, select)?;
+        let (sort_keys, expr_count) =
+            resolve_sort_keys_with_exprs(&select.sort_clause, &merged_ctx, select, &mut rows)?;
         rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
+        // Strip temporary expression columns appended for sorting
+        if expr_count > 0 {
+            for row in rows.iter_mut() {
+                row.truncate(row.len() - expr_count);
+            }
+        }
     }
 
     // OFFSET
@@ -1924,33 +2313,52 @@ struct SortKey {
     nulls_first: bool,
 }
 
-fn resolve_sort_keys(
+/// Extended ORDER BY resolver that supports arbitrary expressions (e.g. `embedding <-> '[1,0,0]'`).
+/// Expression results are appended as temporary columns to each row; the caller must strip them.
+/// Returns (sort_keys, number_of_expression_columns_appended).
+fn resolve_sort_keys_with_exprs(
     sort_clause: &[pg_query::protobuf::Node],
     ctx: &JoinContext,
     select: &pg_query::protobuf::SelectStmt,
-) -> Result<Vec<SortKey>, String> {
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<(Vec<SortKey>, usize), String> {
     let mut keys = Vec::new();
+    let mut expr_nodes: Vec<(usize, &NodeEnum)> = Vec::new(); // (key_index, expr_node)
+    let base_width = if rows.is_empty() {
+        ctx.total_columns
+    } else {
+        rows[0].len()
+    };
+    let mut next_col = base_width;
+
     for snode in sort_clause {
         if let Some(NodeEnum::SortBy(sb)) = snode.node.as_ref() {
-            let col_idx = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
+            let inner = sb.node.as_ref().and_then(|n| n.node.as_ref());
+            let col_idx = match inner {
                 Some(NodeEnum::ColumnRef(cref)) => resolve_column(cref, ctx)?,
                 Some(NodeEnum::AConst(ac)) => {
-                    // Ordinal: ORDER BY 1 means first column in target list
                     let ordinal = match &ac.val {
                         Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival as usize,
                         _ => return Err("invalid ORDER BY ordinal".into()),
                     };
                     resolve_ordinal_to_col_idx(ordinal, select, ctx)?
                 }
-                _ => return Err("unsupported ORDER BY expression".into()),
+                Some(expr_node) => {
+                    // Arbitrary expression — will be evaluated per-row
+                    let idx = next_col;
+                    next_col += 1;
+                    expr_nodes.push((keys.len(), expr_node));
+                    idx
+                }
+                None => return Err("ORDER BY missing expression".into()),
             };
 
-            let ascending = sb.sortby_dir
-                != pg_query::protobuf::SortByDir::SortbyDesc as i32;
+            let ascending =
+                sb.sortby_dir != pg_query::protobuf::SortByDir::SortbyDesc as i32;
             let nulls_first = match sb.sortby_nulls {
                 x if x == pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32 => true,
                 x if x == pg_query::protobuf::SortByNulls::SortbyNullsLast as i32 => false,
-                _ => !ascending, // default: NULLS LAST for ASC, FIRST for DESC
+                _ => !ascending,
             };
 
             keys.push(SortKey {
@@ -1960,7 +2368,30 @@ fn resolve_sort_keys(
             });
         }
     }
-    Ok(keys)
+
+    let expr_count = next_col - base_width;
+
+    // Evaluate expression ORDER BY keys for every row
+    if expr_count > 0 {
+        for row in rows.iter_mut() {
+            // Pre-extend with Nulls
+            row.resize(next_col, Value::Null);
+        }
+        // Need to clone expr_nodes data to avoid borrow issues
+        let expr_data: Vec<(usize, NodeEnum)> = expr_nodes
+            .iter()
+            .map(|(ki, node)| (*ki, (*node).clone()))
+            .collect();
+        for row in rows.iter_mut() {
+            for (key_idx, expr_node) in &expr_data {
+                let col_idx = keys[*key_idx].col_idx;
+                let val = eval_expr(expr_node, row, ctx)?;
+                row[col_idx] = val;
+            }
+        }
+    }
+
+    Ok((keys, expr_count))
 }
 
 fn resolve_ordinal_to_col_idx(
@@ -3563,5 +3994,96 @@ mod tests {
         let err = execute("SELECT (SELECT id FROM t)");
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("more than one row"));
+    }
+
+    // ── Vector type tests ────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_create_insert_select() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 2.0, 3.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[4.0, 5.0, 6.0]')").unwrap();
+        let r = execute("SELECT * FROM items").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][1], Some("[1,2,3]".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_l2_distance() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 0.0, 0.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[0.0, 1.0, 0.0]')").unwrap();
+        execute("INSERT INTO items VALUES (3, '[1.0, 1.0, 0.0]')").unwrap();
+        // L2 distance from [1,0,0]: item 1=0, item 3=1, item 2=sqrt(2)
+        let r = execute("SELECT id FROM items ORDER BY embedding <-> '[1.0, 0.0, 0.0]' LIMIT 2")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into())); // closest
+        assert_eq!(r.rows[1][0], Some("3".into())); // second closest
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_cosine_distance() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 0.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[0.0, 1.0]')").unwrap();
+        execute("INSERT INTO items VALUES (3, '[0.707, 0.707]')").unwrap();
+        // Cosine distance from [1,0]: item 1=0, item 3~0.29, item 2=1
+        let r = execute("SELECT id FROM items ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 2")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_inner_product() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 2.0, 3.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[3.0, 2.0, 1.0]')").unwrap();
+        // Inner product with [1,0,0]: item 1=1, item 2=3
+        // Negative inner product: item 1=-1, item 2=-3
+        // ORDER BY <#> (ascending): item 2 first (most similar via inner product)
+        let r =
+            execute("SELECT id FROM items ORDER BY embedding <#> '[1.0, 0.0, 0.0]'").unwrap();
+        assert_eq!(r.rows[0][0], Some("2".into())); // highest inner product
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_dimension_mismatch() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 2.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[1.0, 2.0, 3.0]')").unwrap();
+        // Different dimensions should error
+        let err = execute("SELECT id FROM items ORDER BY embedding <-> '[1.0, 2.0]'");
+        // This will error during the sort comparison
+        assert!(err.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_knn_search() {
+        setup();
+        execute("CREATE TABLE points (id int, pos vector)").unwrap();
+        execute("INSERT INTO points VALUES (1, '[0.0, 0.0]')").unwrap();
+        execute("INSERT INTO points VALUES (2, '[1.0, 1.0]')").unwrap();
+        execute("INSERT INTO points VALUES (3, '[2.0, 2.0]')").unwrap();
+        execute("INSERT INTO points VALUES (4, '[10.0, 10.0]')").unwrap();
+        // KNN: 3 nearest to [1.5, 1.5]
+        let r = execute("SELECT id FROM points ORDER BY pos <-> '[1.5, 1.5]' LIMIT 3").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Some("2".into())); // [1,1] closest to [1.5,1.5]
+        assert_eq!(r.rows[1][0], Some("3".into())); // [2,2] next
+        // third is [0,0] which is closer than [10,10]
+        assert_eq!(r.rows[2][0], Some("1".into()));
     }
 }
