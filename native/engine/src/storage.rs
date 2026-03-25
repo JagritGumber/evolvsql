@@ -1,6 +1,6 @@
 use crate::types::Value;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 /// In-memory row storage. Each table maps to a Vec of rows.
@@ -18,6 +18,13 @@ type Row = Vec<Value>;
 
 struct TableStore {
     rows: Vec<Row>,
+    /// Hash indexes for unique constraints: column_index -> set of values.
+    /// O(1) constraint checks instead of O(N) full table scan.
+    unique_indexes: HashMap<usize, HashSet<Value>>,
+    /// Composite PK column indices (stored for index rebuild).
+    pk_cols: Vec<usize>,
+    /// Composite PK index: set of composite key tuples.
+    pk_index: Option<HashSet<Vec<Value>>>,
 }
 
 fn key(schema: &str, name: &str) -> String {
@@ -38,8 +45,41 @@ pub fn create_table(schema: &str, name: &str) {
     let mut store = STORE.write();
     store.insert(
         key(schema, name),
-        Arc::new(RwLock::new(TableStore { rows: Vec::new() })),
+        Arc::new(RwLock::new(TableStore {
+            rows: Vec::new(),
+            unique_indexes: HashMap::new(),
+            pk_cols: Vec::new(),
+            pk_index: None,
+        })),
     );
+}
+
+/// Register a hash index for a unique/PK column. O(1) constraint checks.
+pub fn add_unique_index(schema: &str, name: &str, col_idx: usize) -> Result<(), String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+    let mut idx = HashSet::new();
+    for row in &table.rows {
+        if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
+            idx.insert(row[col_idx].clone());
+        }
+    }
+    table.unique_indexes.insert(col_idx, idx);
+    Ok(())
+}
+
+/// Register a composite PK hash index. O(1) constraint checks.
+pub fn add_pk_index(schema: &str, name: &str, pk_cols: &[usize]) -> Result<(), String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+    let mut idx = HashSet::new();
+    for row in &table.rows {
+        let key: Vec<Value> = pk_cols.iter().map(|&i| row[i].clone()).collect();
+        idx.insert(key);
+    }
+    table.pk_cols = pk_cols.to_vec();
+    table.pk_index = Some(idx);
+    Ok(())
 }
 
 pub fn drop_table(schema: &str, name: &str) {
@@ -75,6 +115,12 @@ pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
     let mut table = tbl.write();
     let count = table.rows.len() as u64;
     table.rows.clear();
+    for idx in table.unique_indexes.values_mut() {
+        idx.clear();
+    }
+    if let Some(ref mut pk_idx) = table.pk_index {
+        pk_idx.clear();
+    }
     Ok(count)
 }
 
@@ -87,7 +133,11 @@ pub fn delete_where(
     let mut table = tbl.write();
     let before = table.rows.len();
     table.rows.retain(|row| !predicate(row));
-    Ok((before - table.rows.len()) as u64)
+    let deleted = before - table.rows.len();
+    if deleted > 0 {
+        rebuild_indexes(&mut table);
+    }
+    Ok(deleted as u64)
 }
 
 /// Delete matching rows and return the deleted rows (for RETURNING clause).
@@ -108,30 +158,56 @@ pub fn delete_where_returning(
             true
         }
     });
+    if !deleted.is_empty() {
+        rebuild_indexes(&mut table);
+    }
     Ok(deleted)
 }
 
-pub fn update_rows(
-    schema: &str,
-    name: &str,
-    predicate: impl Fn(&Row) -> bool,
-    updater: impl Fn(&mut Row),
-) -> Result<u64, String> {
-    let tbl = get_table(schema, name)?;
-    let mut table = tbl.write();
-    let mut count = 0u64;
-    for row in table.rows.iter_mut() {
-        if predicate(row) {
-            updater(row);
-            count += 1;
+
+
+// ── Index maintenance helpers ─────────────────────────────────────────
+
+/// Add a row's values to all applicable indexes.
+fn add_to_indexes(table: &mut TableStore, row: &Row) {
+    for (&col_idx, idx) in table.unique_indexes.iter_mut() {
+        if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
+            idx.insert(row[col_idx].clone());
         }
     }
-    Ok(count)
+    if table.pk_cols.len() > 1 {
+        if let Some(pk_idx) = &mut table.pk_index {
+            let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
+            pk_idx.insert(key);
+        }
+    }
+}
+
+/// Rebuild all indexes from current rows. Used after UPDATE and DELETE
+/// to ensure composite PK index consistency.
+fn rebuild_indexes(table: &mut TableStore) {
+    for (&col_idx, idx) in table.unique_indexes.iter_mut() {
+        idx.clear();
+        for row in &table.rows {
+            if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
+                idx.insert(row[col_idx].clone());
+            }
+        }
+    }
+    if let Some(pk_idx) = &mut table.pk_index {
+        pk_idx.clear();
+        for row in &table.rows {
+            let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
+            pk_idx.insert(key);
+        }
+    }
 }
 
 /// Insert with uniqueness check under a single write lock (no TOCTOU race).
 /// `unique_checks` is a list of (column_index, constraint_name) pairs.
 /// `pk_cols` is a list of column indices forming the composite primary key (if any).
+/// Uses O(1) hash index lookups instead of O(N) full table scans.
+#[allow(dead_code)]
 pub fn insert_checked(
     schema: &str,
     name: &str,
@@ -142,12 +218,11 @@ pub fn insert_checked(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
 
-    // Composite PK check
+    // Composite PK check — O(1) via hash index
     if pk_cols.len() > 1 {
-        let new_key: Vec<&Value> = pk_cols.iter().map(|&i| &row[i]).collect();
-        for erow in &table.rows {
-            let ekey: Vec<&Value> = pk_cols.iter().map(|&i| &erow[i]).collect();
-            if new_key == ekey {
+        if let Some(ref pk_idx) = table.pk_index {
+            let key: Vec<Value> = pk_cols.iter().map(|&i| row[i].clone()).collect();
+            if pk_idx.contains(&key) {
                 return Err(format!(
                     "duplicate key value violates unique constraint \"{}.{}_pkey\"",
                     schema, name
@@ -156,13 +231,13 @@ pub fn insert_checked(
         }
     }
 
-    // Per-column unique checks
+    // Per-column unique checks — O(1) via hash index
     for &(col_idx, ref cname) in unique_checks {
         if matches!(row[col_idx], Value::Null) {
             continue; // NULLs don't violate UNIQUE
         }
-        for erow in &table.rows {
-            if col_idx < erow.len() && erow[col_idx] == row[col_idx] {
+        if let Some(idx) = table.unique_indexes.get(&col_idx) {
+            if idx.contains(&row[col_idx]) {
                 return Err(format!(
                     "duplicate key value violates unique constraint \"{}\"",
                     cname
@@ -171,6 +246,8 @@ pub fn insert_checked(
         }
     }
 
+    // Update indexes after successful validation
+    add_to_indexes(&mut table, &row);
     table.rows.push(row);
     Ok(())
 }
@@ -178,6 +255,7 @@ pub fn insert_checked(
 /// Insert multiple rows atomically with uniqueness checks.
 /// All rows are validated against existing data AND each other before any are committed.
 /// If any row fails validation, no rows are inserted.
+/// Uses O(1) hash index lookups plus temporary batch sets for intra-batch checks.
 pub fn insert_batch_checked(
     schema: &str,
     name: &str,
@@ -188,58 +266,56 @@ pub fn insert_batch_checked(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
 
-    for (i, row) in rows.iter().enumerate() {
-        // Composite PK check against existing rows
+    // Temporary batch sets for intra-batch duplicate detection
+    let mut batch_unique: HashMap<usize, HashSet<Value>> = HashMap::new();
+    let mut batch_pk: HashSet<Vec<Value>> = HashSet::new();
+
+    for row in rows.iter() {
+        // Composite PK check — O(1) against index + batch set
         if pk_cols.len() > 1 {
-            let new_key: Vec<&Value> = pk_cols.iter().map(|&ci| &row[ci]).collect();
-            for erow in &table.rows {
-                let ekey: Vec<&Value> = pk_cols.iter().map(|&ci| &erow[ci]).collect();
-                if new_key == ekey {
+            let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
+            if let Some(ref pk_idx) = table.pk_index {
+                if pk_idx.contains(&key) {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}.{}_pkey\"",
                         schema, name
                     ));
                 }
             }
-            // Check against previous rows in this batch
-            for prev in &rows[..i] {
-                let pkey: Vec<&Value> = pk_cols.iter().map(|&ci| &prev[ci]).collect();
-                if new_key == pkey {
-                    return Err(format!(
-                        "duplicate key value violates unique constraint \"{}.{}_pkey\"",
-                        schema, name
-                    ));
-                }
+            if !batch_pk.insert(key) {
+                return Err(format!(
+                    "duplicate key value violates unique constraint \"{}.{}_pkey\"",
+                    schema, name
+                ));
             }
         }
 
-        // Per-column unique checks against existing rows
+        // Per-column unique checks — O(1) against index + batch set
         for &(col_idx, ref cname) in unique_checks {
             if matches!(row[col_idx], Value::Null) {
-                continue; // NULLs don't violate UNIQUE
+                continue;
             }
-            for erow in &table.rows {
-                if col_idx < erow.len() && erow[col_idx] == row[col_idx] {
+            if let Some(idx) = table.unique_indexes.get(&col_idx) {
+                if idx.contains(&row[col_idx]) {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}\"",
                         cname
                     ));
                 }
             }
-            // Check against previous rows in this batch
-            for prev in &rows[..i] {
-                if !matches!(prev[col_idx], Value::Null) && prev[col_idx] == row[col_idx] {
-                    return Err(format!(
-                        "duplicate key value violates unique constraint \"{}\"",
-                        cname
-                    ));
-                }
+            let batch_set = batch_unique.entry(col_idx).or_default();
+            if !batch_set.insert(row[col_idx].clone()) {
+                return Err(format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    cname
+                ));
             }
         }
     }
 
-    // All validated — push all atomically
+    // All validated — push all atomically and update indexes
     for row in rows {
+        add_to_indexes(&mut table, &row);
         table.rows.push(row);
     }
     Ok(())
@@ -295,6 +371,9 @@ pub fn update_rows_checked(
     }
     table.rows = new_rows; // atomic replacement — if panic occurs during clone, originals are untouched
 
+    // Rebuild indexes from final row state
+    rebuild_indexes(&mut table);
+
     Ok(count)
 }
 
@@ -303,9 +382,16 @@ pub fn update_rows_checked(
 pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
+    for idx in table.unique_indexes.values_mut() {
+        idx.clear();
+    }
+    if let Some(ref mut pk_idx) = table.pk_index {
+        pk_idx.clear();
+    }
     Ok(std::mem::take(&mut table.rows))
 }
 
+#[allow(dead_code)]
 pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let tbl = get_table(schema, name)?;
     let table = tbl.read();

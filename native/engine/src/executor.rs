@@ -16,6 +16,8 @@ use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
 
+
+
 /// Parse cache: concurrent reads via RwLock, write only on cache miss.
 /// Bounded to MAX_PARSE_CACHE entries — clears on overflow to avoid unbounded heap growth.
 const MAX_PARSE_CACHE: usize = 1024;
@@ -363,8 +365,32 @@ fn exec_create_table(
         columns,
     };
 
-    catalog::create_table(table)?;
+    catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
+
+    // Wire up hash indexes for PK/UNIQUE columns — O(1) constraint checks
+    let pk_cols: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.primary_key)
+        .map(|(i, _)| i)
+        .collect();
+
+    for (i, col) in table.columns.iter().enumerate() {
+        // For composite PK, individual columns get their own unique index
+        // only if they also have a standalone UNIQUE constraint.
+        // Single-column PK always gets an index.
+        if col.primary_key && pk_cols.len() == 1 {
+            storage::add_unique_index(schema, table_name, i)?;
+        } else if col.unique {
+            storage::add_unique_index(schema, table_name, i)?;
+        }
+    }
+
+    if pk_cols.len() > 1 {
+        storage::add_pk_index(schema, table_name, &pk_cols)?;
+    }
 
     Ok(QueryResult {
         tag: "CREATE TABLE".into(),
@@ -645,7 +671,7 @@ fn exec_insert(
 
 // ── DEFAULT value application ─────────────────────────────────────────
 
-fn apply_default(default_expr: &Option<catalog::DefaultExpr>, schema: &str) -> Result<Value, String> {
+fn apply_default(default_expr: &Option<catalog::DefaultExpr>, _schema: &str) -> Result<Value, String> {
     match default_expr {
         Some(catalog::DefaultExpr::Literal(v)) => Ok(v.clone()),
         Some(catalog::DefaultExpr::NextVal(seq_fqn)) => {
@@ -1188,13 +1214,12 @@ fn eval_a_expr(
             return match (&left, &right) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    let dist: f32 = a
-                        .iter()
-                        .zip(b.iter())
-                        .map(|(x, y)| (x - y) * (x - y))
-                        .sum::<f32>()
-                        .sqrt();
-                    Ok(Value::Float(dist as f64))
+                    // Single-pass sum-of-squared-differences — no intermediate
+                    // allocation, no branches in inner loop → SIMD-friendly.
+                    let dist_sq: f32 = a.iter().zip(b.iter())
+                        .map(|(x, y)| { let d = x - y; d * d })
+                        .sum();
+                    Ok(Value::Float(dist_sq.sqrt() as f64))
                 }
                 (Value::Vector(a), Value::Vector(b)) => Err(format!(
                     "different vector dimensions {} and {}",
@@ -1208,10 +1233,13 @@ fn eval_a_expr(
             return match (&left, &right) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-                    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    let denom = norm_a * norm_b;
+                    // Single-pass cosine: dot product + both norms in one
+                    // iteration — 3x fewer passes, no branches → SIMD-friendly.
+                    let (dot, norm_a_sq, norm_b_sq) = a.iter().zip(b.iter())
+                        .fold((0.0f32, 0.0f32, 0.0f32), |(d, na, nb), (x, y)| {
+                            (d + x * y, na + x * x, nb + y * y)
+                        });
+                    let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
                     if denom == 0.0 {
                         Ok(Value::Float(1.0))
                     } else {
@@ -1483,6 +1511,61 @@ fn eval_where(
     }
 }
 
+// ── Fast equality filter (Principle 4: vectorized WHERE) ─────────────
+
+/// Bypass eval_expr for the most common WHERE pattern: `column = constant`.
+/// Direct column-index comparison with zero AST walking overhead.
+struct FastEqualityFilter {
+    col_idx: usize,
+    value: Value,
+}
+
+impl FastEqualityFilter {
+    #[inline(always)]
+    fn matches(&self, row: &[Value]) -> bool {
+        if self.col_idx >= row.len() { return false; }
+        let v = &row[self.col_idx];
+        // Use both == (same-type fast path) and compare() (cross-type: Int vs Float)
+        *v == self.value || v.compare(&self.value) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
+/// Try to extract a fast equality filter from a WHERE clause.
+/// Returns `None` for anything other than simple `ColumnRef = AConst` patterns,
+/// falling through to the generic eval_where loop.
+fn try_fast_equality_filter(
+    where_clause: &Option<Box<pg_query::protobuf::Node>>,
+    ctx: &JoinContext,
+) -> Option<FastEqualityFilter> {
+    let wc = where_clause.as_ref()?;
+    let node = wc.node.as_ref()?;
+
+    if let NodeEnum::AExpr(expr) = node {
+        // Must be AEXPR_OP with "=" operator
+        let op = extract_op_name(&expr.name).ok()?;
+        if op != "=" { return None; }
+
+        let left = expr.lexpr.as_ref()?.node.as_ref()?;
+        let right = expr.rexpr.as_ref()?.node.as_ref()?;
+
+        // Pattern: ColumnRef = Constant
+        if let NodeEnum::ColumnRef(cref) = left {
+            let col_idx = resolve_column(cref, ctx).ok()?;
+            let value = eval_const(Some(right));
+            if matches!(value, Value::Null) { return None; } // NULL = x is never true
+            return Some(FastEqualityFilter { col_idx, value });
+        }
+        // Pattern: Constant = ColumnRef
+        if let NodeEnum::ColumnRef(cref) = right {
+            let col_idx = resolve_column(cref, ctx).ok()?;
+            let value = eval_const(Some(left));
+            if matches!(value, Value::Null) { return None; }
+            return Some(FastEqualityFilter { col_idx, value });
+        }
+    }
+    None
+}
+
 // ── Helper extractors ─────────────────────────────────────────────────
 
 fn extract_op_name(name_nodes: &[pg_query::protobuf::Node]) -> Result<String, String> {
@@ -1562,6 +1645,10 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
             };
             let table_def = catalog::get_table(schema, &rv.relname)
                 .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
+            // JOIN path: scan() (clone) is required here because rows must be owned
+            // to combine with rows from other tables in the JOIN. scan_with() would
+            // hold the read lock, preventing concurrent access to other tables and
+            // making multi-table lock acquisition deadlock-prone.
             let rows = storage::scan(schema, &rv.relname)?;
             let ncols = table_def.columns.len();
             let ctx = JoinContext {
@@ -2086,18 +2173,32 @@ fn exec_select_raw(
                 total_columns: ncols,
             };
 
-            // Filter inside the read lock — clone only matching rows
+            // Filter inside the read lock — clone only matching rows.
+            
+            let fast_filter = try_fast_equality_filter(&select.where_clause, &ctx);
             let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
                 let mut filtered = Vec::new();
-                for row in all_rows {
-                    if eval_where(&select.where_clause, row, &ctx)? {
-                        filtered.push(row.clone());
+                if let Some(ref ff) = fast_filter {
+                    // Fast path: direct column comparison — no eval_expr overhead.
+                    // Principle 4: vectorized WHERE for simple equality.
+                    for row in all_rows {
+                        if ff.matches(row) {
+                            filtered.push(row.clone());
+                        }
+                    }
+                } else {
+                    // General path: full eval_where with AST walking.
+                    for row in all_rows {
+                        if eval_where(&select.where_clause, row, &ctx)? {
+                            filtered.push(row.clone());
+                        }
                     }
                 }
                 Ok(filtered)
             })?;
 
-            return exec_select_raw_post_filter(select, ctx, rows, 0);
+            let result = exec_select_raw_post_filter(select, ctx, rows, 0);
+            return result;
         }
     }
 
@@ -2146,7 +2247,7 @@ fn exec_select_raw(
     };
 
     // WHERE filter
-    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut rows = Vec::new();
     for row in eval_rows {
         if eval_where(&select.where_clause, &row, &merged_ctx)? {
             rows.push(row);
@@ -2161,7 +2262,7 @@ fn exec_select_raw_post_filter(
     select: &pg_query::protobuf::SelectStmt,
     merged_ctx: JoinContext,
     mut rows: Vec<Vec<Value>>,
-    outer_width: usize,
+    _outer_width: usize,
 ) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
@@ -2259,7 +2360,8 @@ fn exec_select_raw_post_filter(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let mut result_rows: Vec<Vec<Value>> = Vec::new();
+    
+    let mut result_rows = Vec::new();
     for row in &rows {
         let mut result_row = Vec::new();
         for t in &targets {
@@ -2282,6 +2384,8 @@ fn exec_select_raw_post_filter(
         }
         result_rows.push(result_row);
     }
+
+    
 
     Ok((columns, result_rows))
 }
@@ -2987,10 +3091,14 @@ fn exec_delete(
 
     let (count, deleted_rows) = if delete.where_clause.is_some() {
         let ctx = JoinContext::single(schema, table_name, table_def.clone());
-        let all_rows = storage::scan(schema, table_name)?;
-        for row in &all_rows {
-            eval_where(&delete.where_clause, row, &ctx)?;
-        }
+        // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
+        // This catches expression errors (bad column refs, type mismatches) before mutation.
+        storage::scan_with(schema, table_name, |all_rows| {
+            for row in all_rows {
+                eval_where(&delete.where_clause, row, &ctx)?;
+            }
+            Ok(())
+        })?;
         if has_returning {
             let wc = delete.where_clause.clone();
             let rows = storage::delete_where_returning(schema, table_name, |row| {
@@ -3062,11 +3170,14 @@ fn exec_update(
         }
     }
 
-    // Validate WHERE clause against all rows first
-    let all_rows = storage::scan(schema, table_name)?;
-    for row in &all_rows {
-        eval_where(&update.where_clause, row, &ctx)?;
-    }
+    // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
+    // This catches expression errors (bad column refs, type mismatches) before mutation.
+    storage::scan_with(schema, table_name, |all_rows| {
+        for row in all_rows {
+            eval_where(&update.where_clause, row, &ctx)?;
+        }
+        Ok(())
+    })?;
 
     let wc = update.where_clause.clone();
     let td = table_def.clone();

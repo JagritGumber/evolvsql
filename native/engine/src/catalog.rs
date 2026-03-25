@@ -81,6 +81,7 @@ pub fn table_exists(schema: &str, name: &str) -> bool {
     cat.tables.contains_key(&fqn(schema, name))
 }
 
+#[allow(dead_code)]
 pub fn list_tables(schema: &str) -> Vec<Table> {
     let cat = CATALOG.read();
     let prefix = format!("{}.", schema);
