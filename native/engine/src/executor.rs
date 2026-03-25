@@ -363,8 +363,32 @@ fn exec_create_table(
         columns,
     };
 
-    catalog::create_table(table)?;
+    catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
+
+    // Wire up hash indexes for PK/UNIQUE columns — O(1) constraint checks
+    let pk_cols: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.primary_key)
+        .map(|(i, _)| i)
+        .collect();
+
+    for (i, col) in table.columns.iter().enumerate() {
+        // For composite PK, individual columns get their own unique index
+        // only if they also have a standalone UNIQUE constraint.
+        // Single-column PK always gets an index.
+        if col.primary_key && pk_cols.len() == 1 {
+            storage::add_unique_index(schema, table_name, i)?;
+        } else if col.unique && !col.primary_key {
+            storage::add_unique_index(schema, table_name, i)?;
+        }
+    }
+
+    if pk_cols.len() > 1 {
+        storage::add_pk_index(schema, table_name, &pk_cols)?;
+    }
 
     Ok(QueryResult {
         tag: "CREATE TABLE".into(),
