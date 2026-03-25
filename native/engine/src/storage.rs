@@ -91,6 +91,7 @@ pub fn delete_where(
 }
 
 /// Delete matching rows and return the deleted rows (for RETURNING clause).
+/// Uses retain + side-channel to avoid 2x memory allocation (#10).
 pub fn delete_where_returning(
     schema: &str,
     name: &str,
@@ -99,15 +100,14 @@ pub fn delete_where_returning(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
     let mut deleted = Vec::new();
-    let mut kept = Vec::new();
-    for row in table.rows.drain(..) {
-        if predicate(&row) {
-            deleted.push(row);
+    table.rows.retain(|row| {
+        if predicate(row) {
+            deleted.push(row.clone()); // clone only deleted rows
+            false
         } else {
-            kept.push(row);
+            true
         }
-    }
-    table.rows = kept;
+    });
     Ok(deleted)
 }
 
@@ -175,7 +175,78 @@ pub fn insert_checked(
     Ok(())
 }
 
+/// Insert multiple rows atomically with uniqueness checks.
+/// All rows are validated against existing data AND each other before any are committed.
+/// If any row fails validation, no rows are inserted.
+pub fn insert_batch_checked(
+    schema: &str,
+    name: &str,
+    rows: Vec<Row>,
+    unique_checks: &[(usize, String)],
+    pk_cols: &[usize],
+) -> Result<(), String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+
+    for (i, row) in rows.iter().enumerate() {
+        // Composite PK check against existing rows
+        if pk_cols.len() > 1 {
+            let new_key: Vec<&Value> = pk_cols.iter().map(|&ci| &row[ci]).collect();
+            for erow in &table.rows {
+                let ekey: Vec<&Value> = pk_cols.iter().map(|&ci| &erow[ci]).collect();
+                if new_key == ekey {
+                    return Err(format!(
+                        "duplicate key value violates unique constraint \"{}.{}_pkey\"",
+                        schema, name
+                    ));
+                }
+            }
+            // Check against previous rows in this batch
+            for prev in &rows[..i] {
+                let pkey: Vec<&Value> = pk_cols.iter().map(|&ci| &prev[ci]).collect();
+                if new_key == pkey {
+                    return Err(format!(
+                        "duplicate key value violates unique constraint \"{}.{}_pkey\"",
+                        schema, name
+                    ));
+                }
+            }
+        }
+
+        // Per-column unique checks against existing rows
+        for &(col_idx, ref cname) in unique_checks {
+            if matches!(row[col_idx], Value::Null) {
+                continue; // NULLs don't violate UNIQUE
+            }
+            for erow in &table.rows {
+                if col_idx < erow.len() && erow[col_idx] == row[col_idx] {
+                    return Err(format!(
+                        "duplicate key value violates unique constraint \"{}\"",
+                        cname
+                    ));
+                }
+            }
+            // Check against previous rows in this batch
+            for prev in &rows[..i] {
+                if !matches!(prev[col_idx], Value::Null) && prev[col_idx] == row[col_idx] {
+                    return Err(format!(
+                        "duplicate key value violates unique constraint \"{}\"",
+                        cname
+                    ));
+                }
+            }
+        }
+    }
+
+    // All validated — push all atomically
+    for row in rows {
+        table.rows.push(row);
+    }
+    Ok(())
+}
+
 /// Update matching rows with validation. Returns error if any updater fails.
+/// Fixes: intra-batch uniqueness check (#3) and panic-safe atomic swap (#6).
 pub fn update_rows_checked(
     schema: &str,
     name: &str,
@@ -186,23 +257,44 @@ pub fn update_rows_checked(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
 
-    // First pass: compute new rows and validate
+    // First pass: compute new rows and validate against existing rows
     let mut updates: Vec<(usize, Row)> = Vec::new();
     let mut updater = updater;
     for (idx, row) in table.rows.iter().enumerate() {
         if predicate(row) {
             let new_row = updater(row)?;
-            // Validate against all OTHER rows (excluding current)
+            // Validate against all OTHER existing rows (excluding current)
             validator(&new_row, &table.rows, idx)?;
             updates.push((idx, new_row));
         }
     }
 
-    // Second pass: apply
-    let count = updates.len() as u64;
-    for (idx, new_row) in updates {
-        table.rows[idx] = new_row;
+    // Intra-batch uniqueness: build the prospective final state and validate
+    // that no two updated rows collide with each other on unique columns.
+    if updates.len() > 1 {
+        // Check each pair of new rows for uniqueness violations
+        for i in 0..updates.len() {
+            for j in (i + 1)..updates.len() {
+                let row_a = &updates[i].1;
+                let row_b = &updates[j].1;
+                // Check all columns for equality — the caller's validator
+                // handles per-column unique constraints against existing rows,
+                // but we need to check new rows against each other too.
+                // We re-use the validator: validate row_a against a slice
+                // containing only row_b (with skip_idx that won't match).
+                validator(row_a, &[row_b.clone()], usize::MAX)?;
+            }
+        }
     }
+
+    // Second pass: atomic swap — build new rows vec, then replace all at once (#6)
+    let count = updates.len() as u64;
+    let mut new_rows = table.rows.clone();
+    for (idx, new_row) in updates {
+        new_rows[idx] = new_row;
+    }
+    table.rows = new_rows; // atomic replacement — if panic occurs during clone, originals are untouched
+
     Ok(count)
 }
 
