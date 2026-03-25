@@ -1341,6 +1341,7 @@ fn parse_text_to_value(s: &str, oid: i32) -> Value {
         16 => Value::Bool(s == "t" || s == "true"),
         20 | 21 | 23 => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(s.into())),
         700 | 701 | 1700 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s.into())),
+        16385 => parse_vector_literal(s).unwrap_or(Value::Text(s.into())),
         _ => Value::Text(s.into()),
     }
 }
