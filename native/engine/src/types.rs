@@ -1,19 +1,64 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::Arc;
 
 /// Runtime values for SQL expressions.
 ///
 /// PartialEq, Eq, and Hash are manually implemented to satisfy HashMap's
 /// contract for Float values: NaN == NaN (for GROUP BY grouping, matching
 /// PostgreSQL behavior) and +0.0 == -0.0 (IEEE 754 equality).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Text uses Arc<str> for zero-copy sharing: identical strings are stored once
+/// in memory, reducing heap allocation for repeated values (VM philosophy).
+#[derive(Debug, Clone)]
 pub enum Value {
     Null,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Text(String),
+    Text(Arc<str>),
     Bytea(Vec<u8>),
     Vector(Vec<f32>),
+}
+
+// Manual Serialize/Deserialize to handle Arc<str> transparently as String.
+impl Serialize for Value {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStructVariant;
+        match self {
+            Value::Null => serializer.serialize_unit_variant("Value", 0, "Null"),
+            Value::Bool(b) => serializer.serialize_newtype_variant("Value", 1, "Bool", b),
+            Value::Int(i) => serializer.serialize_newtype_variant("Value", 2, "Int", i),
+            Value::Float(f) => serializer.serialize_newtype_variant("Value", 3, "Float", f),
+            Value::Text(s) => serializer.serialize_newtype_variant("Value", 4, "Text", s.as_ref()),
+            Value::Bytea(b) => serializer.serialize_newtype_variant("Value", 5, "Bytea", b),
+            Value::Vector(v) => serializer.serialize_newtype_variant("Value", 6, "Vector", v),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum ValueHelper {
+            Null,
+            Bool(bool),
+            Int(i64),
+            Float(f64),
+            Text(String),
+            Bytea(Vec<u8>),
+            Vector(Vec<f32>),
+        }
+        let helper = ValueHelper::deserialize(deserializer)?;
+        Ok(match helper {
+            ValueHelper::Null => Value::Null,
+            ValueHelper::Bool(b) => Value::Bool(b),
+            ValueHelper::Int(i) => Value::Int(i),
+            ValueHelper::Float(f) => Value::Float(f),
+            ValueHelper::Text(s) => Value::Text(Arc::from(s)),
+            ValueHelper::Bytea(b) => Value::Bytea(b),
+            ValueHelper::Vector(v) => Value::Vector(v),
+        })
+    }
 }
 
 impl PartialEq for Value {
@@ -90,7 +135,7 @@ impl Value {
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
             Value::Int(i) => Some(i.to_string()),
             Value::Float(f) => Some(f.to_string()),
-            Value::Text(s) => Some(s.clone()),
+            Value::Text(s) => Some(s.to_string()),
             Value::Bytea(b) => Some(format!("\\x{}", hex_encode(b))),
             Value::Vector(v) => {
                 let inner: Vec<String> = v.iter().map(|f| {

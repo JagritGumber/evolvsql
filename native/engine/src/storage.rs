@@ -329,13 +329,13 @@ mod tests {
         insert(
             "public",
             "t",
-            vec![Value::Int(1), Value::Text("hello".into())],
+            vec![Value::Int(1), Value::Text(Arc::from("hello"))],
         )
         .unwrap();
         insert(
             "public",
             "t",
-            vec![Value::Int(2), Value::Text("world".into())],
+            vec![Value::Int(2), Value::Text(Arc::from("world"))],
         )
         .unwrap();
         let rows = scan("public", "t").unwrap();

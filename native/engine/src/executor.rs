@@ -6,7 +6,7 @@
 //   unique columns for O(1) constraint validation. Phase 2 work (index engine).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use parking_lot::RwLock;
 use pg_query::NodeEnum;
@@ -17,8 +17,10 @@ use crate::storage;
 use crate::types::{TypeOid, Value};
 
 /// Parse cache: concurrent reads via RwLock, write only on cache miss.
+/// Bounded to MAX_PARSE_CACHE entries — clears on overflow to avoid unbounded heap growth.
+const MAX_PARSE_CACHE: usize = 1024;
 static PARSE_CACHE: LazyLock<RwLock<HashMap<String, pg_query::protobuf::ParseResult>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+    LazyLock::new(|| RwLock::new(HashMap::with_capacity(MAX_PARSE_CACHE)));
 
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
@@ -191,6 +193,9 @@ pub fn execute(sql: &str) -> Result<QueryResult, String> {
             let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
             let proto = parsed.protobuf;
             let mut cache = PARSE_CACHE.write();
+            if cache.len() >= MAX_PARSE_CACHE {
+                cache.clear();
+            }
             cache.insert(sql.to_string(), proto.clone());
             proto
         }
@@ -773,9 +778,9 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
         Some(NodeEnum::String(s)) => {
             let trimmed = s.sval.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                parse_vector_literal(trimmed).unwrap_or(Value::Text(s.sval.clone()))
+                parse_vector_literal(trimmed).unwrap_or(Value::Text(Arc::from(s.sval.as_str())))
             } else {
-                Value::Text(s.sval.clone())
+                Value::Text(Arc::from(s.sval.as_str()))
             }
         }
         Some(NodeEnum::AConst(ac)) => {
@@ -790,12 +795,12 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
                     pg_query::protobuf::a_const::Val::Sval(s) => {
                         let trimmed = s.sval.trim();
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            parse_vector_literal(trimmed).unwrap_or(Value::Text(s.sval.clone()))
+                            parse_vector_literal(trimmed).unwrap_or(Value::Text(Arc::from(s.sval.as_str())))
                         } else {
-                            Value::Text(s.sval.clone())
+                            Value::Text(Arc::from(s.sval.as_str()))
                         }
                     }
-                    pg_query::protobuf::a_const::Val::Bsval(s) => Value::Text(s.bsval.clone()),
+                    pg_query::protobuf::a_const::Val::Bsval(s) => Value::Text(Arc::from(s.bsval.as_str())),
                     pg_query::protobuf::a_const::Val::Boolval(b) => Value::Bool(b.boolval),
                 }
             } else {
@@ -841,10 +846,10 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
                             parse_vector_literal(trimmed)
                         } else {
-                            Ok(Value::Text(s.sval.clone()))
+                            Ok(Value::Text(Arc::from(s.sval.as_str())))
                         }
                     }
-                    pg_query::protobuf::a_const::Val::Bsval(s) => Ok(Value::Text(s.bsval.clone())),
+                    pg_query::protobuf::a_const::Val::Bsval(s) => Ok(Value::Text(Arc::from(s.bsval.as_str()))),
                     pg_query::protobuf::a_const::Val::Boolval(b) => Ok(Value::Bool(b.boolval)),
                 }
             } else {
@@ -862,7 +867,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
                 parse_vector_literal(trimmed)
             } else {
-                Ok(Value::Text(s.sval.clone()))
+                Ok(Value::Text(Arc::from(s.sval.as_str())))
             }
         }
         NodeEnum::TypeCast(tc) => {
@@ -1167,7 +1172,7 @@ fn eval_a_expr(
             _ => {
                 let l = left.to_text().unwrap_or_default();
                 let r = right.to_text().unwrap_or_default();
-                Ok(Value::Text(format!("{}{}", l, r)))
+                Ok(Value::Text(Arc::from(format!("{}{}", l, r).as_str())))
             }
         };
     }
@@ -1381,10 +1386,10 @@ fn eval_func_call(
 fn parse_text_to_value(s: &str, oid: i32) -> Value {
     match oid {
         16 => Value::Bool(s == "t" || s == "true"),
-        20 | 21 | 23 => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(s.into())),
-        700 | 701 | 1700 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s.into())),
-        16385 => parse_vector_literal(s).unwrap_or(Value::Text(s.into())),
-        _ => Value::Text(s.into()),
+        20 | 21 | 23 => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(Arc::from(s))),
+        700 | 701 | 1700 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(Arc::from(s))),
+        16385 => parse_vector_literal(s).unwrap_or(Value::Text(Arc::from(s))),
+        _ => Value::Text(Arc::from(s)),
     }
 }
 
@@ -1398,12 +1403,12 @@ fn parse_seq_name(s: &str) -> (&str, &str) {
 fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "upper" => match args.first() {
-            Some(Value::Text(s)) => Ok(Value::Text(s.to_uppercase())),
+            Some(Value::Text(s)) => Ok(Value::Text(Arc::from(s.to_uppercase().as_str()))),
             Some(Value::Null) => Ok(Value::Null),
             _ => Err("upper() requires text argument".into()),
         },
         "lower" => match args.first() {
-            Some(Value::Text(s)) => Ok(Value::Text(s.to_lowercase())),
+            Some(Value::Text(s)) => Ok(Value::Text(Arc::from(s.to_lowercase().as_str()))),
             Some(Value::Null) => Ok(Value::Null),
             _ => Err("lower() requires text argument".into()),
         },
@@ -1420,7 +1425,7 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
                     v => v.to_text().unwrap_or_default(),
                 })
                 .collect();
-            Ok(Value::Text(parts))
+            Ok(Value::Text(Arc::from(parts.as_str())))
         }
         "abs" => match args.first() {
             Some(Value::Int(n)) => Ok(Value::Int(
