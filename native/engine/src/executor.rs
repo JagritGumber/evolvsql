@@ -5,7 +5,6 @@
 // TODO(#8): O(N) uniqueness check on INSERT/UPDATE — needs hash indexes on
 //   unique columns for O(1) constraint validation. Phase 2 work (index engine).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -17,31 +16,7 @@ use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
 
-// ── Thread-local buffer pool (Principle 2: Buffer Pooling) ────────────
-// NIF calls run on dirty schedulers which are real OS threads,
-// so thread_local works correctly here.
-thread_local! {
-    static ROW_POOL: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::with_capacity(1024));
-}
 
-fn take_row_buf() -> Vec<Vec<Value>> {
-    ROW_POOL.with(|pool| {
-        let mut p = pool.borrow_mut();
-        let mut buf = std::mem::take(&mut *p);
-        buf.clear(); // reset length, keep capacity
-        buf
-    })
-}
-
-fn return_row_buf(mut buf: Vec<Vec<Value>>) {
-    buf.clear();
-    ROW_POOL.with(|pool| {
-        let mut p = pool.borrow_mut();
-        if buf.capacity() > p.capacity() {
-            *p = buf; // keep the bigger buffer
-        }
-    });
-}
 
 /// Parse cache: concurrent reads via RwLock, write only on cache miss.
 /// Bounded to MAX_PARSE_CACHE entries — clears on overflow to avoid unbounded heap growth.
@@ -2196,7 +2171,7 @@ fn exec_select_raw(
             };
 
             // Filter inside the read lock — clone only matching rows.
-            // Uses pooled buffer to avoid per-query Vec allocation (Principle 2).
+            
             let fast_filter = try_fast_equality_filter(&select.where_clause, &ctx);
             let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
                 let mut filtered = Vec::new();
@@ -2220,7 +2195,6 @@ fn exec_select_raw(
             })?;
 
             let result = exec_select_raw_post_filter(select, ctx, rows, 0);
-            // Note: buffer is consumed by post_filter; it handles return_row_buf.
             return result;
         }
     }
@@ -2269,7 +2243,7 @@ fn exec_select_raw(
         (all_rows, inner_ctx, 0)
     };
 
-    // WHERE filter — pooled buffer avoids per-query allocation (Principle 2)
+    // WHERE filter
     let mut rows = Vec::new();
     for row in eval_rows {
         if eval_where(&select.where_clause, &row, &merged_ctx)? {
@@ -2383,7 +2357,7 @@ fn exec_select_raw_post_filter(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    // Projection — pooled buffer for result rows (Principle 2)
+    
     let mut result_rows = Vec::new();
     for row in &rows {
         let mut result_row = Vec::new();
@@ -2408,7 +2382,6 @@ fn exec_select_raw_post_filter(
         result_rows.push(result_row);
     }
 
-    // Return the input rows buffer to the pool (consumed, no longer needed)
     
 
     Ok((columns, result_rows))
