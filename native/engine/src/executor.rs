@@ -383,7 +383,7 @@ fn exec_create_table(
         // Single-column PK always gets an index.
         if col.primary_key && pk_cols.len() == 1 {
             storage::add_unique_index(schema, table_name, i)?;
-        } else if col.unique && !col.primary_key {
+        } else if col.unique {
             storage::add_unique_index(schema, table_name, i)?;
         }
     }
@@ -671,7 +671,7 @@ fn exec_insert(
 
 // ── DEFAULT value application ─────────────────────────────────────────
 
-fn apply_default(default_expr: &Option<catalog::DefaultExpr>, schema: &str) -> Result<Value, String> {
+fn apply_default(default_expr: &Option<catalog::DefaultExpr>, _schema: &str) -> Result<Value, String> {
     match default_expr {
         Some(catalog::DefaultExpr::Literal(v)) => Ok(v.clone()),
         Some(catalog::DefaultExpr::NextVal(seq_fqn)) => {
@@ -2259,7 +2259,7 @@ fn exec_select_raw_post_filter(
     select: &pg_query::protobuf::SelectStmt,
     merged_ctx: JoinContext,
     mut rows: Vec<Vec<Value>>,
-    outer_width: usize,
+    _outer_width: usize,
 ) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {

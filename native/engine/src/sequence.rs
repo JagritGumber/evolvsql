@@ -8,7 +8,7 @@ static SEQUENCES: LazyLock<RwLock<HashMap<String, Sequence>>> =
 struct Sequence {
     current: i64,
     increment: i64,
-    start: i64,
+    #[allow(dead_code)] start: i64,
 }
 
 fn key(schema: &str, name: &str) -> String {
@@ -18,7 +18,7 @@ fn key(schema: &str, name: &str) -> String {
 pub fn create_sequence(
     schema: &str,
     name: &str,
-    start: i64,
+    #[allow(dead_code)] start: i64,
     increment: i64,
 ) -> Result<(), String> {
     let mut seqs = SEQUENCES.write();
@@ -66,6 +66,7 @@ pub fn setval(schema: &str, name: &str, value: i64) -> Result<i64, String> {
     Ok(value)
 }
 
+#[allow(dead_code)]
 pub fn drop_sequence(schema: &str, name: &str) {
     let mut seqs = SEQUENCES.write();
     seqs.remove(&key(schema, name));

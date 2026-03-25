@@ -164,23 +164,7 @@ pub fn delete_where_returning(
     Ok(deleted)
 }
 
-pub fn update_rows(
-    schema: &str,
-    name: &str,
-    predicate: impl Fn(&Row) -> bool,
-    updater: impl Fn(&mut Row),
-) -> Result<u64, String> {
-    let tbl = get_table(schema, name)?;
-    let mut table = tbl.write();
-    let mut count = 0u64;
-    for row in table.rows.iter_mut() {
-        if predicate(row) {
-            updater(row);
-            count += 1;
-        }
-    }
-    Ok(count)
-}
+
 
 // ── Index maintenance helpers ─────────────────────────────────────────
 
@@ -223,6 +207,7 @@ fn rebuild_indexes(table: &mut TableStore) {
 /// `unique_checks` is a list of (column_index, constraint_name) pairs.
 /// `pk_cols` is a list of column indices forming the composite primary key (if any).
 /// Uses O(1) hash index lookups instead of O(N) full table scans.
+#[allow(dead_code)]
 pub fn insert_checked(
     schema: &str,
     name: &str,
@@ -406,6 +391,7 @@ pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String
     Ok(std::mem::take(&mut table.rows))
 }
 
+#[allow(dead_code)]
 pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let tbl = get_table(schema, name)?;
     let table = tbl.read();
