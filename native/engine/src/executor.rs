@@ -1874,7 +1874,10 @@ fn execute_hash_join(
         }
     }
 
-    let mut result = Vec::with_capacity(left_rows.len());
+    // Pre-estimate result size: for INNER join, assume ~avg matches per left row
+    let est_size = if is_inner { left_rows.len() * 2 } else { left_rows.len() };
+    let mut result = Vec::with_capacity(est_size);
+    let combined_width = left_width + right_width;
     let mut right_matched = if is_right || is_full {
         vec![false; right_rows.len()]
     } else {
@@ -1889,7 +1892,8 @@ fn execute_hash_join(
         // NULL key never matches — treat as unmatched for LEFT/FULL joins
         if matches!(key, Value::Null) {
             if is_left || is_full {
-                let mut row = left.clone();
+                let mut row = Vec::with_capacity(combined_width);
+                row.extend_from_slice(left);
                 row.extend_from_slice(&null_right);
                 result.push(row);
             }
@@ -1904,7 +1908,7 @@ fn execute_hash_join(
                 if !right_matched.is_empty() {
                     right_matched[ri] = true;
                 }
-                let mut combined = Vec::with_capacity(left_width + right_width);
+                let mut combined = Vec::with_capacity(combined_width);
                 combined.extend_from_slice(left);
                 combined.extend_from_slice(&right_rows[ri]);
                 result.push(combined);
@@ -1913,7 +1917,8 @@ fn execute_hash_join(
 
         // LEFT/FULL: emit unmatched left row with NULLs
         if !left_matched && (is_left || is_full) {
-            let mut row = left.clone();
+            let mut row = Vec::with_capacity(combined_width);
+            row.extend_from_slice(left);
             row.extend_from_slice(&null_right);
             result.push(row);
         }
