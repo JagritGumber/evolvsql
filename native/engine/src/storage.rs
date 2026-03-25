@@ -1,29 +1,23 @@
 use crate::types::Value;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 /// In-memory row storage. Each table maps to a Vec of rows.
 /// This is the Phase 1 storage — will be replaced with a persistent
 /// B-tree engine with undo-log MVCC and direct I/O in Phase 2.
-static STORE: LazyLock<RwLock<Storage>> = LazyLock::new(|| RwLock::new(Storage::new()));
+///
+/// Per-table RwLock: the outer HashMap RwLock is only held during
+/// table creation/deletion. Individual table locks allow concurrent
+/// reads on different tables and concurrent same-table reads via
+/// parking_lot's reader-writer fairness.
+static STORE: LazyLock<RwLock<HashMap<String, Arc<RwLock<TableStore>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 type Row = Vec<Value>;
 
 struct TableStore {
     rows: Vec<Row>,
-}
-
-struct Storage {
-    tables: HashMap<String, TableStore>,
-}
-
-impl Storage {
-    fn new() -> Self {
-        Self {
-            tables: HashMap::new(),
-        }
-    }
 }
 
 fn key(schema: &str, name: &str) -> String {
@@ -32,22 +26,23 @@ fn key(schema: &str, name: &str) -> String {
 
 pub fn create_table(schema: &str, name: &str) {
     let mut store = STORE.write();
-    store
-        .tables
-        .insert(key(schema, name), TableStore { rows: Vec::new() });
+    store.insert(
+        key(schema, name),
+        Arc::new(RwLock::new(TableStore { rows: Vec::new() })),
+    );
 }
 
 pub fn drop_table(schema: &str, name: &str) {
     let mut store = STORE.write();
-    store.tables.remove(&key(schema, name));
+    store.remove(&key(schema, name));
 }
 
 pub fn insert(schema: &str, name: &str, row: Row) -> Result<(), String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
     table.rows.push(row);
     Ok(())
 }
@@ -55,18 +50,18 @@ pub fn insert(schema: &str, name: &str, row: Row) -> Result<(), String> {
 pub fn scan(schema: &str, name: &str) -> Result<Vec<Row>, String> {
     let store = STORE.read();
     let table = store
-        .tables
         .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let table = table.read();
     Ok(table.rows.clone())
 }
 
 pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
     let count = table.rows.len() as u64;
     table.rows.clear();
     Ok(count)
@@ -77,11 +72,11 @@ pub fn delete_where(
     name: &str,
     predicate: impl Fn(&Row) -> bool,
 ) -> Result<u64, String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
     let before = table.rows.len();
     table.rows.retain(|row| !predicate(row));
     Ok((before - table.rows.len()) as u64)
@@ -93,11 +88,11 @@ pub fn delete_where_returning(
     name: &str,
     predicate: impl Fn(&Row) -> bool,
 ) -> Result<Vec<Row>, String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
     let mut deleted = Vec::new();
     let mut kept = Vec::new();
     for row in table.rows.drain(..) {
@@ -117,11 +112,11 @@ pub fn update_rows(
     predicate: impl Fn(&Row) -> bool,
     updater: impl Fn(&mut Row),
 ) -> Result<u64, String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
     let mut count = 0u64;
     for row in table.rows.iter_mut() {
         if predicate(row) {
@@ -142,11 +137,11 @@ pub fn insert_checked(
     unique_checks: &[(usize, String)],
     pk_cols: &[usize],
 ) -> Result<(), String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
 
     // Composite PK check
     if pk_cols.len() > 1 {
@@ -189,11 +184,11 @@ pub fn update_rows_checked(
     updater: impl FnMut(&Row) -> Result<Row, String>,
     validator: impl Fn(&Row, &[Row], usize) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
 
     // First pass: compute new rows and validate
     let mut updates: Vec<(usize, Row)> = Vec::new();
@@ -218,26 +213,26 @@ pub fn update_rows_checked(
 /// Delete all rows and return them (for DELETE ... RETURNING without WHERE).
 /// Single write lock — no TOCTOU race.
 pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String> {
-    let mut store = STORE.write();
+    let store = STORE.read();
     let table = store
-        .tables
-        .get_mut(&key(schema, name))
+        .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut table = table.write();
     Ok(std::mem::take(&mut table.rows))
 }
 
 pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let store = STORE.read();
     let table = store
-        .tables
         .get(&key(schema, name))
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let table = table.read();
     Ok(table.rows.len() as u64)
 }
 
 pub fn reset() {
     let mut store = STORE.write();
-    store.tables.clear();
+    store.clear();
 }
 
 #[cfg(test)]

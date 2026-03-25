@@ -1,11 +1,17 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use parking_lot::RwLock;
 use pg_query::NodeEnum;
 use serde::Serialize;
 
 use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
+
+/// Parse cache: concurrent reads via RwLock, write only on cache miss.
+static PARSE_CACHE: LazyLock<RwLock<HashMap<String, pg_query::protobuf::ParseResult>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
@@ -152,10 +158,21 @@ fn column_type_oid(idx: usize, ctx: &JoinContext) -> Result<i32, String> {
 }
 
 pub fn execute(sql: &str) -> Result<QueryResult, String> {
-    let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+    let protobuf = {
+        let cache = PARSE_CACHE.read();
+        if let Some(cached) = cache.get(sql) {
+            cached.clone()
+        } else {
+            drop(cache);
+            let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+            let proto = parsed.protobuf;
+            let mut cache = PARSE_CACHE.write();
+            cache.insert(sql.to_string(), proto.clone());
+            proto
+        }
+    };
 
-    let raw_stmt = parsed
-        .protobuf
+    let raw_stmt = protobuf
         .stmts
         .first()
         .ok_or("empty query")?;
