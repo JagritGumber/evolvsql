@@ -1,3 +1,10 @@
+// TODO(#5): Describe Portal sends NoData — requires parsing SQL to determine
+//   column types without execution. Needs a type-inference pass over the AST
+//   to return RowDescription for prepared statements. Phase 2 work.
+//
+// TODO(#8): O(N) uniqueness check on INSERT/UPDATE — needs hash indexes on
+//   unique columns for O(1) constraint validation. Phase 2 work (index engine).
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -564,9 +571,8 @@ fn exec_insert(
         .and_then(|s| s.node.as_ref())
         .ok_or("INSERT missing VALUES")?;
 
-    let mut row_count = 0u64;
     let has_returning = !insert.returning_list.is_empty();
-    let mut inserted_rows: Vec<Vec<Value>> = Vec::new();
+    let mut all_rows: Vec<Vec<Value>> = Vec::new();
 
     if let NodeEnum::SelectStmt(sel) = select {
         for values_list in &sel.values_lists {
@@ -610,17 +616,19 @@ fn exec_insert(
                 }
 
                 check_not_null(&table_def, &row)?;
-                let (unique_checks, pk_cols) = build_unique_checks(&table_def);
-                if has_returning {
-                    inserted_rows.push(row.clone());
-                }
-                storage::insert_checked(
-                    schema, table_name, row, &unique_checks, &pk_cols,
-                )?;
-                row_count += 1;
+                all_rows.push(row);
             }
         }
     }
+
+    // Atomic batch insert: validate ALL rows against existing data AND each other,
+    // then insert all at once. If any row fails, nothing is committed. (#4)
+    let (unique_checks, pk_cols) = build_unique_checks(&table_def);
+    let row_count = all_rows.len() as u64;
+    let inserted_rows = if has_returning { all_rows.clone() } else { Vec::new() };
+    storage::insert_batch_checked(
+        schema, table_name, all_rows, &unique_checks, &pk_cols,
+    )?;
 
     let tag = format!("INSERT 0 {}", row_count);
     if has_returning {
@@ -1762,9 +1770,13 @@ fn execute_hash_join(
     let right_local_key = right_key_col - left_width;
 
     // BUILD phase: hash table on right side, keyed by join column value
+    // Skip NULL keys — in SQL, NULL = NULL is FALSE in JOIN ON conditions.
     let mut hash_table: HashMap<Value, Vec<usize>> = HashMap::new();
     for (i, row) in right_rows.iter().enumerate() {
         if right_local_key < row.len() {
+            if matches!(row[right_local_key], Value::Null) {
+                continue; // NULL never matches in JOIN ON
+            }
             let key = row[right_local_key].clone();
             hash_table.entry(key).or_default().push(i);
         }
@@ -1781,6 +1793,17 @@ fn execute_hash_join(
     for left in left_rows {
         if left_key_col >= left.len() { continue; }
         let key = &left[left_key_col];
+
+        // NULL key never matches — treat as unmatched for LEFT/FULL joins
+        if matches!(key, Value::Null) {
+            if is_left || is_full {
+                let mut row = left.clone();
+                row.extend_from_slice(&null_right);
+                result.push(row);
+            }
+            continue;
+        }
+
         let mut left_matched = false;
 
         if let Some(indices) = hash_table.get(key) {
@@ -2140,7 +2163,7 @@ fn exec_select_raw_post_filter(
         let agg_result = exec_select_aggregate(select, &merged_ctx, rows)?;
         // Convert string rows back to typed Value rows using column OIDs
         let col_oids: Vec<i32> = agg_result.columns.iter().map(|(_, oid)| *oid).collect();
-        let value_rows: Vec<Vec<Value>> = agg_result
+        let mut value_rows: Vec<Vec<Value>> = agg_result
             .rows
             .into_iter()
             .map(|row| {
@@ -2156,6 +2179,34 @@ fn exec_select_raw_post_filter(
                     .collect()
             })
             .collect();
+
+        // Apply ORDER BY to aggregate results (Bug #2 / #7 fix)
+        if !select.sort_clause.is_empty() {
+            let sort_keys = resolve_aggregate_sort_keys(
+                &select.sort_clause, &agg_result.columns, &merged_ctx, select,
+            )?;
+            value_rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
+        }
+
+        // Apply OFFSET
+        if let Some(ref offset_node) = select.limit_offset {
+            if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
+                let n = n.max(0) as usize;
+                if n >= value_rows.len() {
+                    value_rows.clear();
+                } else {
+                    value_rows.drain(0..n);
+                }
+            }
+        }
+
+        // Apply LIMIT
+        if let Some(ref limit_node) = select.limit_count {
+            if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
+                value_rows.truncate(n.max(0) as usize);
+            }
+        }
+
         return Ok((agg_result.columns, value_rows));
     }
 
@@ -2447,6 +2498,85 @@ fn eval_const_i64(node: Option<&NodeEnum>) -> Option<i64> {
         Value::Float(f) => Some(f as i64),
         _ => None,
     }
+}
+
+// ── Aggregate ORDER BY helpers ─────────────────────────────────────────
+
+/// Resolve ORDER BY keys for aggregate query results.
+/// Maps sort expressions to indices in the aggregate result columns.
+fn resolve_aggregate_sort_keys(
+    sort_clause: &[pg_query::protobuf::Node],
+    result_columns: &[(String, i32)],
+    _source_ctx: &JoinContext,
+    select: &pg_query::protobuf::SelectStmt,
+) -> Result<Vec<SortKey>, String> {
+    let mut keys = Vec::new();
+
+    for snode in sort_clause {
+        if let Some(NodeEnum::SortBy(sb)) = snode.node.as_ref() {
+            let inner = sb.node.as_ref().and_then(|n| n.node.as_ref());
+            let col_idx = match inner {
+                Some(NodeEnum::AConst(ac)) => {
+                    // Ordinal reference (e.g. ORDER BY 2)
+                    let ordinal = match &ac.val {
+                        Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival as usize,
+                        _ => return Err("invalid ORDER BY ordinal".into()),
+                    };
+                    if ordinal == 0 || ordinal > result_columns.len() {
+                        return Err(format!(
+                            "ORDER BY position {} is not in select list", ordinal
+                        ));
+                    }
+                    ordinal - 1
+                }
+                Some(NodeEnum::ColumnRef(cref)) => {
+                    // Column name — find in result columns
+                    let col_name = extract_col_name(cref);
+                    result_columns.iter().position(|(name, _)| {
+                        name.eq_ignore_ascii_case(&col_name)
+                    }).ok_or_else(|| format!(
+                        "column \"{}\" not found in aggregate result", col_name
+                    ))?
+                }
+                Some(NodeEnum::FuncCall(fc)) => {
+                    // Aggregate expression in ORDER BY (e.g. ORDER BY SUM(amount))
+                    // Match against select target list to find result column index
+                    let sort_func_name = extract_func_name(fc);
+                    let mut found = None;
+                    for (i, target) in select.target_list.iter().enumerate() {
+                        if let Some(NodeEnum::ResTarget(rt)) = target.node.as_ref() {
+                            if let Some(NodeEnum::FuncCall(tfc)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+                                if extract_func_name(tfc) == sort_func_name {
+                                    // Compare arguments for match
+                                    if fc.args.len() == tfc.args.len() {
+                                        found = Some(i);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    found.ok_or_else(|| format!(
+                        "aggregate {}() in ORDER BY not found in select list",
+                        sort_func_name
+                    ))?
+                }
+                _ => return Err("unsupported ORDER BY expression in aggregate query".into()),
+            };
+
+            let ascending =
+                sb.sortby_dir != pg_query::protobuf::SortByDir::SortbyDesc as i32;
+            let nulls_first = match sb.sortby_nulls {
+                x if x == pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32 => true,
+                x if x == pg_query::protobuf::SortByNulls::SortbyNullsLast as i32 => false,
+                _ => !ascending,
+            };
+
+            keys.push(SortKey { col_idx, ascending, nulls_first });
+        }
+    }
+
+    Ok(keys)
 }
 
 // ── Aggregate execution ───────────────────────────────────────────────
@@ -4085,5 +4215,90 @@ mod tests {
         assert_eq!(r.rows[1][0], Some("3".into())); // [2,2] next
         // third is [0,0] which is closer than [10,10]
         assert_eq!(r.rows[2][0], Some("1".into()));
+    }
+
+    // ── Bug fix regression tests ─────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn hash_join_null_keys() {
+        setup();
+        execute("CREATE TABLE a (id int, val text)").unwrap();
+        execute("CREATE TABLE b (id int, data text)").unwrap();
+        execute("INSERT INTO a VALUES (1, 'x')").unwrap();
+        execute("INSERT INTO a VALUES (NULL, 'z')").unwrap();
+        execute("INSERT INTO b VALUES (1, 'p')").unwrap();
+        execute("INSERT INTO b VALUES (NULL, 'q')").unwrap();
+        let r = execute("SELECT a.val, b.data FROM a JOIN b ON a.id = b.id").unwrap();
+        assert_eq!(r.rows.len(), 1); // only id=1 matches, NOT NULL=NULL
+        assert_eq!(r.rows[0][0], Some("x".into()));
+        assert_eq!(r.rows[0][1], Some("p".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn left_join_null_keys() {
+        setup();
+        execute("CREATE TABLE a (id int, val text)").unwrap();
+        execute("CREATE TABLE b (id int, data text)").unwrap();
+        execute("INSERT INTO a VALUES (1, 'x')").unwrap();
+        execute("INSERT INTO a VALUES (2, 'y')").unwrap();
+        execute("INSERT INTO a VALUES (NULL, 'z')").unwrap();
+        execute("INSERT INTO b VALUES (1, 'p')").unwrap();
+        execute("INSERT INTO b VALUES (NULL, 'q')").unwrap();
+        let r = execute("SELECT a.val, b.data FROM a LEFT JOIN b ON a.id = b.id ORDER BY a.val").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        // x matches p, y gets NULL, z gets NULL (NOT matched with q!)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aggregate_order_by() {
+        setup();
+        execute("CREATE TABLE sales (region text, amount int)").unwrap();
+        execute("INSERT INTO sales VALUES ('east', 100)").unwrap();
+        execute("INSERT INTO sales VALUES ('west', 200)").unwrap();
+        execute("INSERT INTO sales VALUES ('east', 150)").unwrap();
+        let r = execute("SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) DESC").unwrap();
+        assert_eq!(r.rows[0][0], Some("east".into())); // east=250 > west=200
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aggregate_limit() {
+        setup();
+        execute("CREATE TABLE t (grp text, val int)").unwrap();
+        execute("INSERT INTO t VALUES ('a', 1)").unwrap();
+        execute("INSERT INTO t VALUES ('b', 2)").unwrap();
+        execute("INSERT INTO t VALUES ('c', 3)").unwrap();
+        let r = execute("SELECT grp, COUNT(*) FROM t GROUP BY grp LIMIT 2").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn multi_row_insert_atomic() {
+        setup();
+        execute("CREATE TABLE t (id int PRIMARY KEY)").unwrap();
+        let err = execute("INSERT INTO t VALUES (1), (1)"); // duplicate in same batch
+        assert!(err.is_err());
+        // Table should be empty — nothing committed
+        let r = execute("SELECT * FROM t").unwrap();
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_intra_batch_uniqueness() {
+        setup();
+        execute("CREATE TABLE t (id int PRIMARY KEY, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        let err = execute("UPDATE t SET id = 5"); // both rows get id=5 — should error
+        assert!(err.is_err());
+        // Original data should be unchanged
+        let r = execute("SELECT * FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
     }
 }
