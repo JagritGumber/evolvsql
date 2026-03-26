@@ -2334,11 +2334,17 @@ fn exec_select_raw(
                     if let Some(vec_col) = ctx.sources[0].table_def.columns.iter().position(|c| c.type_oid == TypeOid::Vector) {
                         let _ = storage::ensure_hnsw_index(schema, &rv.relname, vec_col, knn.metric);
                     }
+                    // Account for OFFSET: request k + offset from HNSW
+                    let offset = select.limit_offset.as_ref()
+                        .and_then(|n| eval_const_i64(n.node.as_ref()))
+                        .unwrap_or(0).max(0) as usize;
                     let hnsw_results = storage::hnsw_search(
-                        schema, &rv.relname, &knn.query_vector, knn.k,
+                        schema, &rv.relname, &knn.query_vector, knn.k + offset,
                     )?;
-                    let row_ids: Vec<usize> =
-                        hnsw_results.iter().map(|(_, row_id)| *row_id).collect();
+                    let row_ids: Vec<usize> = hnsw_results.iter()
+                        .skip(offset)
+                        .map(|(_, row_id)| *row_id)
+                        .collect();
                     let rows = storage::get_rows_by_ids(schema, &rv.relname, &row_ids)?;
 
                     // Project results (skip ORDER BY / LIMIT in post_filter since
