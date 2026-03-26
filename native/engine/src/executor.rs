@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use bumpalo::Bump;
 use parking_lot::RwLock;
 use pg_query::NodeEnum;
 use serde::Serialize;
@@ -1975,6 +1976,7 @@ fn extract_equi_cols(quals: &NodeEnum, ctx: &JoinContext) -> Option<(usize, usiz
 }
 
 /// Hash join: build hash table on right side, probe with left side. O(N+M).
+/// Uses arena allocation for scratch buffers (bool tracking arrays).
 fn execute_hash_join(
     left_rows: &[Vec<Value>],
     right_rows: &[Vec<Value>],
@@ -1985,6 +1987,9 @@ fn execute_hash_join(
     left_key_col: usize,
     right_key_col: usize,
 ) -> Result<Vec<Vec<Value>>, String> {
+    let arena = Bump::with_capacity(
+        std::mem::size_of::<bool>() * right_rows.len() + 256,
+    );
     let null_right = vec![Value::Null; right_width];
     let null_left = vec![Value::Null; left_width];
 
@@ -2027,10 +2032,12 @@ fn execute_hash_join(
     let est_size = if is_inner { left_rows.len() * 2 } else { left_rows.len() };
     let mut result = Vec::with_capacity(est_size);
     let combined_width = left_width + right_width;
-    let mut right_matched = if is_right || is_full {
-        vec![false; right_rows.len()]
+
+    // Arena-allocate right_matched tracking (bool is Drop-free).
+    let right_matched: &mut [bool] = if is_right || is_full {
+        arena.alloc_slice_fill_copy(right_rows.len(), false)
     } else {
-        Vec::new()
+        &mut []
     };
 
     // PROBE phase: for each left row, look up matching right rows in O(1)
@@ -2087,6 +2094,9 @@ fn execute_hash_join(
     Ok(result)
 }
 
+/// Nested loop join with reusable eval buffer.
+/// Key optimization: reuses one buffer for eval_expr instead of allocating per pair.
+/// Only clones into result on match — saves N×M - K allocations (K = matches).
 fn nested_loop_join(
     left_rows: &[Vec<Value>],
     right_rows: &[Vec<Value>],
@@ -2096,6 +2106,9 @@ fn nested_loop_join(
     left_width: usize,
     right_width: usize,
 ) -> Result<Vec<Vec<Value>>, String> {
+    let arena = Bump::with_capacity(
+        std::mem::size_of::<bool>() * right_rows.len() + 256,
+    );
     let null_right = vec![Value::Null; right_width];
     let null_left = vec![Value::Null; left_width];
     let mut result = Vec::with_capacity(left_rows.len());
@@ -2108,21 +2121,30 @@ fn nested_loop_join(
     if !is_inner && !is_left && !is_right && !is_full {
         return Err(format!("unsupported JOIN type: {}", join_type));
     }
-    let mut right_matched = if is_right || is_full {
-        vec![false; right_rows.len()]
+
+    // Arena-allocate right_matched tracking (bool is Drop-free).
+    let right_matched: &mut [bool] = if is_right || is_full {
+        arena.alloc_slice_fill_copy(right_rows.len(), false)
     } else {
-        Vec::new()
+        &mut []
     };
+
+    // Reusable eval buffer — allocated once, cleared per pair.
+    // This is the key optimization: only 1 allocation for the buffer itself,
+    // vs N×M allocations in the old code.
+    let combined_width = left_width + right_width;
+    let mut eval_buf = Vec::with_capacity(combined_width);
 
     for left in left_rows {
         let mut left_matched = false;
         for (ri, right) in right_rows.iter().enumerate() {
-            let mut combined = Vec::with_capacity(left_width + right_width);
-            combined.extend_from_slice(left);
-            combined.extend_from_slice(right);
+            // Reuse buffer: clear + refill instead of allocating new Vec each pair.
+            eval_buf.clear();
+            eval_buf.extend_from_slice(left);
+            eval_buf.extend_from_slice(right);
 
             let matches = match quals {
-                Some(q) => matches!(eval_expr(q, &combined, ctx)?, Value::Bool(true)),
+                Some(q) => matches!(eval_expr(q, &eval_buf, ctx)?, Value::Bool(true)),
                 None => true, // CROSS JOIN
             };
 
@@ -2131,7 +2153,8 @@ fn nested_loop_join(
                 if !right_matched.is_empty() {
                     right_matched[ri] = true;
                 }
-                result.push(combined);
+                // Only clone on match — non-matching pairs cost zero allocations.
+                result.push(eval_buf.clone());
             }
         }
 
@@ -2184,10 +2207,11 @@ fn execute_from_clause(
         };
 
         // Cross product
+        let combined_width = left_width + right_width;
         let mut new_rows = Vec::with_capacity(rows.len() * right_rows.len());
         for left in &rows {
             for right in &right_rows {
-                let mut combined = Vec::with_capacity(left_width + right_width);
+                let mut combined = Vec::with_capacity(combined_width);
                 combined.extend_from_slice(left);
                 combined.extend_from_slice(right);
                 new_rows.push(combined);
@@ -2362,9 +2386,10 @@ fn exec_select_raw(
                         })
                         .collect::<Result<Vec<_>, String>>()?;
 
-                    let mut result_rows = Vec::new();
+                    let ncols = targets.len();
+                    let mut result_rows = Vec::with_capacity(rows.len());
                     for row in &rows {
-                        let mut result_row = Vec::new();
+                        let mut result_row = Vec::with_capacity(ncols);
                         for t in &targets {
                             let val = match t {
                                 SelectTarget::Column { idx, .. } => {
@@ -2575,9 +2600,11 @@ fn exec_select_raw_post_filter(
         .collect::<Result<Vec<_>, String>>()?;
 
     
-    let mut result_rows = Vec::new();
+    // Pre-allocate result vectors with known sizes.
+    let ncols = targets.len();
+    let mut result_rows = Vec::with_capacity(rows.len());
     for row in &rows {
-        let mut result_row = Vec::new();
+        let mut result_row = Vec::with_capacity(ncols);
         for t in &targets {
             let val = match t {
                 SelectTarget::Column { idx, .. } => {
@@ -2598,8 +2625,6 @@ fn exec_select_raw_post_filter(
         }
         result_rows.push(result_row);
     }
-
-    
 
     Ok((columns, result_rows))
 }
@@ -2918,26 +2943,31 @@ fn exec_select_aggregate(
     if group_col_indices.is_empty() {
         groups.push((vec![], rows));
     } else {
+        // Reusable key buffer — avoids N allocations (one per row).
+        // Only clones into HashMap on new-group creation (K allocations for K groups).
+        let mut key_buf: Vec<Value> = Vec::with_capacity(group_col_indices.len());
         for row in rows {
-            let key: Vec<Value> = group_col_indices.iter().map(|&i| row[i].clone()).collect();
+            key_buf.clear();
+            key_buf.extend(group_col_indices.iter().map(|&i| row[i].clone()));
 
-            if let Some(&idx) = group_index.get(&key) {
+            if let Some(&idx) = group_index.get(&key_buf) {
                 groups[idx].1.push(row);
             } else {
                 let idx = groups.len();
-                group_index.insert(key.clone(), idx);
-                groups.push((key, vec![row]));
+                group_index.insert(key_buf.clone(), idx);
+                groups.push((key_buf.clone(), vec![row]));
             }
         }
     }
 
     // Build result columns and rows
     let mut result_columns = Vec::new();
-    let mut result_rows = Vec::new();
+    let mut result_rows = Vec::with_capacity(groups.len());
     let mut columns_built = false;
+    let target_count = select.target_list.len();
 
     for (group_key, group_rows) in &groups {
-        let mut result_row = Vec::new();
+        let mut result_row = Vec::with_capacity(target_count);
 
         for target in &select.target_list {
             if let Some(NodeEnum::ResTarget(rt)) = target.node.as_ref() {

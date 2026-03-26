@@ -14,6 +14,7 @@ pg_query = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
+bumpalo = { version = "3.16", features = ["collections"] }
 
 [profile.release]
 strip = true
