@@ -1633,6 +1633,7 @@ fn extract_op_name(name_nodes: &[pg_query::protobuf::Node]) -> Result<String, St
 struct KnnPlan {
     query_vector: Vec<f32>,
     k: usize,
+    metric: crate::hnsw::DistanceMetric,
 }
 
 /// Detect the pattern: ORDER BY col <-> '[...]' LIMIT K (or <=>, <#>)
@@ -1672,9 +1673,12 @@ fn try_detect_knn(
     };
 
     let op = extract_op_name(&a_expr.name).ok()?;
-    if !matches!(op.as_str(), "<->" | "<=>" | "<#>") {
-        return None;
-    }
+    let metric = match op.as_str() {
+        "<->" => crate::hnsw::DistanceMetric::L2,
+        "<=>" => crate::hnsw::DistanceMetric::Cosine,
+        "<#>" => crate::hnsw::DistanceMetric::InnerProduct,
+        _ => return None,
+    };
 
     // One side must be a ColumnRef matching the HNSW column, other side a constant vector
     let left = a_expr.lexpr.as_ref()?.node.as_ref()?;
@@ -1701,7 +1705,7 @@ fn try_detect_knn(
     // Extract the constant vector
     let query_vector = extract_const_vector(vec_node)?;
 
-    Some(KnnPlan { query_vector, k })
+    Some(KnnPlan { query_vector, k, metric })
 }
 
 /// Extract a constant vector from an AST node (string literal like '[1.0, 2.0]').
@@ -2326,6 +2330,10 @@ fn exec_select_raw(
             // HNSW fast path: detect ORDER BY <distance_op> LIMIT K pattern
             if select.where_clause.is_none() && !select.sort_clause.is_empty() {
                 if let Some(knn) = try_detect_knn(select, &ctx, schema, &rv.relname) {
+                    // Ensure HNSW index uses the matching metric
+                    if let Some(vec_col) = ctx.sources[0].table_def.columns.iter().position(|c| c.type_oid == TypeOid::Vector) {
+                        let _ = storage::ensure_hnsw_index(schema, &rv.relname, vec_col, knn.metric);
+                    }
                     let hnsw_results = storage::hnsw_search(
                         schema, &rv.relname, &knn.query_vector, knn.k,
                     )?;

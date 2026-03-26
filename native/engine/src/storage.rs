@@ -126,6 +126,7 @@ pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
     if let Some(ref mut pk_idx) = table.pk_index {
         pk_idx.clear();
     }
+    table.hnsw_index = None;
     Ok(count)
 }
 
@@ -205,6 +206,20 @@ fn rebuild_indexes(table: &mut TableStore) {
             let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
             pk_idx.insert(key);
         }
+    }
+    // Rebuild HNSW index — row_ids are positional, so any row shift invalidates them
+    if let Some(ref old_hnsw) = table.hnsw_index {
+        let col_idx = old_hnsw.col_idx();
+        let metric = old_hnsw.metric();
+        let mut new_hnsw = crate::hnsw::HnswIndex::new(metric, col_idx);
+        for (i, row) in table.rows.iter().enumerate() {
+            if col_idx < row.len() {
+                if let Value::Vector(v) = &row[col_idx] {
+                    new_hnsw.insert(i, v.clone());
+                }
+            }
+        }
+        table.hnsw_index = Some(new_hnsw);
     }
 }
 
@@ -393,6 +408,7 @@ pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String
     if let Some(ref mut pk_idx) = table.pk_index {
         pk_idx.clear();
     }
+    table.hnsw_index = None;
     Ok(std::mem::take(&mut table.rows))
 }
 
@@ -413,8 +429,11 @@ pub fn ensure_hnsw_index(
 ) -> Result<(), String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
-    if table.hnsw_index.is_some() {
-        return Ok(()); // already indexed
+    if let Some(ref existing) = table.hnsw_index {
+        if existing.metric() == metric {
+            return Ok(()); // already indexed with matching metric
+        }
+        // Metric mismatch — rebuild with new metric
     }
     let mut idx = HnswIndex::new(metric, col_idx);
     // Bulk-insert existing rows

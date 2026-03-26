@@ -16,7 +16,7 @@ fn ml() -> f64 {
 }
 
 /// Distance metric for vector comparisons.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DistanceMetric {
     L2,
     Cosine,
@@ -62,6 +62,10 @@ impl HnswIndex {
 
     pub fn col_idx(&self) -> usize {
         self.col_idx
+    }
+
+    pub fn metric(&self) -> DistanceMetric {
+        self.metric
     }
 
     /// Insert a vector into the index, associated with the given row_id.
