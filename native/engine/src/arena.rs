@@ -214,8 +214,8 @@ impl ArenaValue {
                 }
                 a == b
             }
-            (ArenaValue::Int(a), ArenaValue::Float(b)) => (*a as f64) == *b,
-            (ArenaValue::Float(a), ArenaValue::Int(b)) => *a == (*b as f64),
+            // No cross-type Int/Float equality — matches Value::PartialEq behavior.
+            // Cross-type comparison lives in compare() (for ORDER BY), not eq_with (for Hash/Eq).
             (ArenaValue::Text(a), ArenaValue::Text(b)) => {
                 // Fast path: same offset = same string
                 if a.offset == b.offset && a.len == b.len {
@@ -229,7 +229,11 @@ impl ArenaValue {
                 arena.bytes[sa..sa + a.len as usize] == arena.bytes[sb..sb + b.len as usize]
             }
             (ArenaValue::Vector(a), ArenaValue::Vector(b)) => {
-                arena.get_vec(*a) == arena.get_vec(*b)
+                // Bitwise comparison (NaN == NaN for GROUP BY), matching Value::PartialEq.
+                let va = arena.get_vec(*a);
+                let vb = arena.get_vec(*b);
+                va.len() == vb.len()
+                    && va.iter().zip(vb.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
             }
             _ => false,
         }
