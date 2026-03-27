@@ -185,17 +185,7 @@ impl ArenaValue {
             (ArenaValue::Text(a), ArenaValue::Text(b)) => {
                 Some(arena.get_str(*a).cmp(arena.get_str(*b)))
             }
-            (ArenaValue::Vector(a), ArenaValue::Vector(b)) => {
-                let va = arena.get_vec(*a);
-                let vb = arena.get_vec(*b);
-                for (x, y) in va.iter().zip(vb.iter()) {
-                    match x.partial_cmp(y) {
-                        Some(Ordering::Equal) => continue,
-                        other => return other,
-                    }
-                }
-                Some(va.len().cmp(&vb.len()))
-            }
+            (ArenaValue::Vector(_), ArenaValue::Vector(_)) => None, // vectors are not orderable (matches Value::compare)
             _ => None,
         }
     }
