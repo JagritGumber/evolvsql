@@ -165,7 +165,13 @@ impl ArenaValue {
             }
             ArenaValue::Vector(v) => {
                 let data = arena.get_vec(*v);
-                let inner: Vec<String> = data.iter().map(|f| f.to_string()).collect();
+                let inner: Vec<String> = data.iter().map(|f| {
+                    if *f == f.trunc() && f.is_finite() && f.abs() < (i32::MAX as f32) {
+                        format!("{}", *f as i32)
+                    } else {
+                        format!("{}", f)
+                    }
+                }).collect();
                 Some(format!("[{}]", inner.join(",")))
             }
         }
@@ -254,6 +260,7 @@ impl ArenaValue {
             }
             ArenaValue::Vector(v) => {
                 let data = arena.get_vec(*v);
+                data.len().hash(state);
                 for f in data {
                     f.to_bits().hash(state);
                 }
