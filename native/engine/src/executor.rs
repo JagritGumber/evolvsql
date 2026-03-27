@@ -527,6 +527,7 @@ fn eval_returning(
 
     // Evaluate RETURNING expressions against each affected row
     let mut rows = Vec::new();
+    let mut ret_arena = QueryArena::new();
     for row in affected_rows {
         let mut result_row = Vec::new();
         for target in &col_exprs {
@@ -542,8 +543,6 @@ fn eval_returning(
                     }
                 }
                 ReturningTarget::Expr(expr) => {
-                    // RETURNING uses Value rows from storage - create local arena
-                    let mut ret_arena = QueryArena::new();
                     let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, &mut ret_arena)).collect();
                     let arena_val = eval_expr(expr, &arena_row, &ctx, &mut ret_arena)?;
                     arena_val.to_value(&ret_arena)
