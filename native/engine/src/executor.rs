@@ -717,7 +717,7 @@ fn exec_insert(
         if storage::has_hnsw_index(schema, table_name).is_some() {
             for (i, row) in inserted_rows.iter().enumerate() {
                 if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
-                    storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone())?;
+                    let _ = storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone());
                 }
             }
         }
