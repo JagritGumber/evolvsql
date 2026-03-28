@@ -997,7 +997,7 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
                                 let i = text.trim().parse::<i64>().map_err(|_| format!("invalid input syntax for integer: \"{}\"", text))?;
                                 return Ok(ArenaValue::Int(i));
                             }
-                            ArenaValue::Float(f) => return Ok(ArenaValue::Int(*f as i64)),
+                            ArenaValue::Float(f) => return Ok(ArenaValue::Int(f.round() as i64)),
                             ArenaValue::Int(_) => return Ok(val),
                             ArenaValue::Bool(b) => return Ok(ArenaValue::Int(if *b { 1 } else { 0 })),
                             _ => {}
@@ -2142,8 +2142,8 @@ fn execute_hash_join(
     } else if right_key_col < left_width && left_key_col >= left_width {
         (right_key_col, left_key_col) // swap
     } else {
-        // Both on same side — can't hash join this, fall back
-        return nested_loop_join(left_rows, right_rows, join_type, None, ctx, left_width, right_width, arena);
+        // Both on same side — can't hash join, return error
+        return Err("JOIN ON condition references columns from the same table on both sides".into());
     };
     let right_local_key = right_key_col - left_width;
 
