@@ -963,7 +963,6 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
                 .and_then(|a| a.node.as_ref())
                 .ok_or("TypeCast missing arg")?;
             let val = eval_expr(inner, row, ctx, arena)?;
-            // Handle cast to vector type
             if let Some(tn) = &tc.type_name {
                 let type_name: String = tn
                     .names
@@ -978,17 +977,71 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
                     })
                     .last()
                     .unwrap_or_default();
-                if type_name == "vector" {
-                    if let ArenaValue::Text(s) = &val {
-                        let text = arena.get_str(*s).to_string();
-                        let trimmed = text.trim();
-                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            let v = parse_vector_literal(trimmed)?;
-                            if let Value::Vector(data) = v {
-                                return Ok(ArenaValue::Vector(arena.alloc_vec(&data)));
+                match type_name.as_str() {
+                    "vector" => {
+                        if let ArenaValue::Text(s) = &val {
+                            let text = arena.get_str(*s).to_string();
+                            let trimmed = text.trim();
+                            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                                let v = parse_vector_literal(trimmed)?;
+                                if let Value::Vector(data) = v {
+                                    return Ok(ArenaValue::Vector(arena.alloc_vec(&data)));
+                                }
                             }
                         }
                     }
+                    "int4" | "int" | "integer" | "int8" | "bigint" => {
+                        match &val {
+                            ArenaValue::Text(s) => {
+                                let text = arena.get_str(*s);
+                                let i = text.trim().parse::<i64>().map_err(|_| format!("invalid input syntax for integer: \"{}\"", text))?;
+                                return Ok(ArenaValue::Int(i));
+                            }
+                            ArenaValue::Float(f) => return Ok(ArenaValue::Int(*f as i64)),
+                            ArenaValue::Int(_) => return Ok(val),
+                            ArenaValue::Bool(b) => return Ok(ArenaValue::Int(if *b { 1 } else { 0 })),
+                            _ => {}
+                        }
+                    }
+                    "float4" | "float8" | "real" | "double precision" | "numeric" => {
+                        match &val {
+                            ArenaValue::Text(s) => {
+                                let text = arena.get_str(*s);
+                                let f = text.trim().parse::<f64>().map_err(|_| format!("invalid input syntax for type double precision: \"{}\"", text))?;
+                                return Ok(ArenaValue::Float(f));
+                            }
+                            ArenaValue::Int(i) => return Ok(ArenaValue::Float(*i as f64)),
+                            ArenaValue::Float(_) => return Ok(val),
+                            _ => {}
+                        }
+                    }
+                    "text" | "varchar" | "char" | "character varying" => {
+                        let text = match &val {
+                            ArenaValue::Int(i) => i.to_string(),
+                            ArenaValue::Float(f) => f.to_string(),
+                            ArenaValue::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+                            ArenaValue::Text(_) => return Ok(val),
+                            _ => return Ok(val),
+                        };
+                        return Ok(ArenaValue::Text(arena.alloc_str(&text)));
+                    }
+                    "bool" | "boolean" => {
+                        match &val {
+                            ArenaValue::Text(s) => {
+                                let text = arena.get_str(*s).trim().to_lowercase();
+                                let b = match text.as_str() {
+                                    "t" | "true" | "yes" | "on" | "1" => true,
+                                    "f" | "false" | "no" | "off" | "0" => false,
+                                    _ => return Err(format!("invalid input syntax for type boolean: \"{}\"", text)),
+                                };
+                                return Ok(ArenaValue::Bool(b));
+                            }
+                            ArenaValue::Int(i) => return Ok(ArenaValue::Bool(*i != 0)),
+                            ArenaValue::Bool(_) => return Ok(val),
+                            _ => {}
+                        }
+                    }
+                    _ => {} // unknown cast type — pass through
                 }
             }
             Ok(val)
@@ -2049,14 +2102,9 @@ fn extract_equi_cols(quals: &NodeEnum, ctx: &JoinContext) -> Option<(usize, usiz
                 None
             }
         }
-        // AND: take the first equality condition
+        // AND: compound conditions — fall back to nested loop for correctness
         NodeEnum::BoolExpr(be) if be.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
-            for arg in &be.args {
-                if let Some(result) = arg.node.as_ref().and_then(|n| extract_equi_cols(n, ctx)) {
-                    return Some(result);
-                }
-            }
-            None
+            None  // Multiple conditions require full evaluation; use nested loop
         }
         _ => None,
     }
@@ -3390,29 +3438,38 @@ fn eval_having_expr(
         NodeEnum::BoolExpr(be) => {
             let boolop = be.boolop;
             if boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
+                let mut has_null = false;
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
                         match eval_having_expr(n, group_rows, ctx, arena)? {
                             ArenaValue::Bool(false) => return Ok(ArenaValue::Bool(false)),
                             ArenaValue::Bool(true) => continue,
-                            _ => return Ok(ArenaValue::Null),
+                            _ => { has_null = true; continue; }
                         }
                     }
                 }
-                Ok(ArenaValue::Bool(true))
+                Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(true) })
             } else if boolop == pg_query::protobuf::BoolExprType::OrExpr as i32 {
+                let mut has_null = false;
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
                         match eval_having_expr(n, group_rows, ctx, arena)? {
                             ArenaValue::Bool(true) => return Ok(ArenaValue::Bool(true)),
-                            _ => continue,
+                            ArenaValue::Bool(false) => continue,
+                            _ => { has_null = true; continue; }
                         }
                     }
                 }
-                Ok(ArenaValue::Bool(false))
+                Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(false) })
             } else {
                 Err("unsupported HAVING boolean expression".into())
             }
+        }
+        NodeEnum::ColumnRef(_) => {
+            if group_rows.is_empty() {
+                return Ok(ArenaValue::Null);
+            }
+            eval_expr(node, &group_rows[0], ctx, arena)
         }
         _ => Err("unsupported expression in HAVING clause".into()),
     }
@@ -4893,5 +4950,72 @@ mod tests {
             overlap,
             k
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn join_multi_condition() {
+        setup();
+        execute("CREATE TABLE jmc_t1 (a INT, b INT)").unwrap();
+        execute("CREATE TABLE jmc_t2 (x INT, y INT)").unwrap();
+        execute("INSERT INTO jmc_t1 VALUES (1, 10), (1, 20), (2, 10)").unwrap();
+        execute("INSERT INTO jmc_t2 VALUES (1, 10), (1, 20), (2, 30)").unwrap();
+        let r = execute("SELECT jmc_t1.a, jmc_t1.b, jmc_t2.y FROM jmc_t1 JOIN jmc_t2 ON jmc_t1.a = jmc_t2.x AND jmc_t1.b = jmc_t2.y").unwrap();
+        assert_eq!(r.rows.len(), 2); // (1,10,10) and (1,20,20) - not 3
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn having_column_ref() {
+        setup();
+        execute("CREATE TABLE hcr_emp (dept TEXT, salary INT)").unwrap();
+        execute("INSERT INTO hcr_emp VALUES ('Sales', 100), ('Sales', 200), ('Eng', 300)").unwrap();
+        let r = execute("SELECT dept, COUNT(*) FROM hcr_emp GROUP BY dept HAVING dept = 'Sales'").unwrap();
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn typecast_int() {
+        setup();
+        execute("CREATE TABLE tci_t (a TEXT)").unwrap();
+        execute("INSERT INTO tci_t VALUES ('42')").unwrap();
+        let r = execute("SELECT a::int + 1 FROM tci_t").unwrap();
+        assert_eq!(r.rows[0][0], Some("43".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn typecast_float() {
+        setup();
+        execute("CREATE TABLE tcf_t (a TEXT)").unwrap();
+        execute("INSERT INTO tcf_t VALUES ('3.14')").unwrap();
+        let r = execute("SELECT a::float8 FROM tcf_t").unwrap();
+        // Float representation may vary, just check it parses
+        let val: f64 = r.rows[0][0].as_ref().unwrap().parse().unwrap();
+        assert!((val - 3.14).abs() < 0.001);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn typecast_text() {
+        setup();
+        execute("CREATE TABLE tct_t (a INT)").unwrap();
+        execute("INSERT INTO tct_t VALUES (99)").unwrap();
+        let r = execute("SELECT a::text FROM tct_t").unwrap();
+        assert_eq!(r.rows[0][0], Some("99".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn typecast_bool() {
+        setup();
+        execute("CREATE TABLE tcb_t (a TEXT)").unwrap();
+        execute("INSERT INTO tcb_t VALUES ('true'), ('false'), ('yes'), ('0')").unwrap();
+        let r = execute("SELECT a::boolean FROM tcb_t").unwrap();
+        assert_eq!(r.rows[0][0], Some("t".to_string()));
+        assert_eq!(r.rows[1][0], Some("f".to_string()));
+        assert_eq!(r.rows[2][0], Some("t".to_string()));
+        assert_eq!(r.rows[3][0], Some("f".to_string()));
     }
 }
