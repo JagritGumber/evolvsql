@@ -129,6 +129,9 @@ pub fn rename_table(schema: &str, old_name: &str, new_name: &str) -> Result<(), 
     let mut cat = CATALOG.write();
     let old_key = fqn(schema, old_name);
     let new_key = fqn(schema, new_name);
+    if cat.tables.contains_key(&new_key) {
+        return Err(format!("relation \"{}\" already exists", new_name));
+    }
     let mut table = cat.tables.remove(&old_key)
         .ok_or_else(|| format!("relation \"{}\" does not exist", old_name))?;
     table.name = new_name.to_string();

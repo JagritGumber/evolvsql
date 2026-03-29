@@ -536,8 +536,14 @@ pub fn alter_drop_column(schema: &str, name: &str, col_idx: usize) {
                 row.remove(col_idx);
             }
         }
-        // Rebuild unique indexes since column indices shifted
+        // Fix all index references after column removal
         t.unique_indexes.clear();
+        t.pk_cols.retain(|c| *c != col_idx);
+        for c in t.pk_cols.iter_mut() {
+            if *c > col_idx { *c -= 1; }
+        }
+        t.pk_index = None; // force rebuild on next insert
+        t.hnsw_index = None; // invalidate - will be lazily recreated
     }
 }
 
