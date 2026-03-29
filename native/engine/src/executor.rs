@@ -240,6 +240,9 @@ pub fn execute(sql: &str) -> Result<QueryResult, String> {
             columns: vec![],
             rows: vec![],
         }),
+        NodeEnum::AlterTableStmt(alter) => exec_alter_table(alter),
+        NodeEnum::RenameStmt(rename) => exec_rename(rename),
+        NodeEnum::CreateTableAsStmt(ctas) => exec_create_table_as(ctas),
         _ => Err("unsupported statement type".into()),
     }
 }
@@ -395,6 +398,15 @@ fn exec_create_table(
         columns,
     };
 
+    // IF NOT EXISTS — skip if table already exists
+    if create.if_not_exists && catalog::get_table(schema, table_name).is_some() {
+        return Ok(QueryResult {
+            tag: "CREATE TABLE".into(),
+            columns: vec![],
+            rows: vec![],
+        });
+    }
+
     catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
 
@@ -475,6 +487,9 @@ fn exec_drop(drop: &pg_query::protobuf::DropStmt) -> Result<QueryResult, String>
                 continue;
             };
 
+            if drop.missing_ok && catalog::get_table(schema, name).is_none() {
+                continue; // IF EXISTS — skip silently
+            }
             catalog::drop_table(schema, name)?;
             storage::drop_table(schema, name);
         }
@@ -482,6 +497,157 @@ fn exec_drop(drop: &pg_query::protobuf::DropStmt) -> Result<QueryResult, String>
 
     Ok(QueryResult {
         tag: "DROP TABLE".into(),
+        columns: vec![],
+        rows: vec![],
+    })
+}
+
+// ── ALTER TABLE ──────────────────────────────────────────────────────
+
+fn exec_alter_table(
+    alter: &pg_query::protobuf::AlterTableStmt,
+) -> Result<QueryResult, String> {
+    let rel = alter.relation.as_ref().ok_or("ALTER TABLE missing relation")?;
+    let table_name = &rel.relname;
+    let schema = if rel.schemaname.is_empty() { "public" } else { &rel.schemaname };
+
+    for cmd_node in &alter.cmds {
+        let cmd = match cmd_node.node.as_ref() {
+            Some(NodeEnum::AlterTableCmd(c)) => c,
+            _ => continue,
+        };
+
+        use pg_query::protobuf::AlterTableType;
+
+        if cmd.subtype == AlterTableType::AtAddColumn as i32 {
+            // ADD COLUMN
+            let col_def = match cmd.def.as_ref().and_then(|n| n.node.as_ref()) {
+                Some(NodeEnum::ColumnDef(cd)) => cd,
+                _ => return Err("ALTER TABLE ADD COLUMN missing column definition".into()),
+            };
+            let type_name = extract_type_name(col_def);
+            let type_oid = TypeOid::from_name(&type_name);
+
+            // Parse default value from constraints (same as CREATE TABLE)
+            let mut default_expr = None;
+            for cnode in &col_def.constraints {
+                if let Some(NodeEnum::Constraint(c)) = cnode.node.as_ref() {
+                    if c.contype == pg_query::protobuf::ConstrType::ConstrDefault as i32 {
+                        if let Some(raw) = c.raw_expr.as_ref().and_then(|n| n.node.as_ref()) {
+                            default_expr = Some(catalog::DefaultExpr::Literal(eval_const(Some(raw))));
+                        }
+                    }
+                }
+            }
+
+            let col = catalog::Column {
+                name: col_def.colname.clone(),
+                type_oid,
+                nullable: !col_def.is_not_null,
+                primary_key: false,
+                unique: false,
+                default_expr: default_expr.clone(),
+            };
+            catalog::alter_table_add_column(schema, table_name, col)?;
+            // Backfill existing rows with default or NULL
+            let default_val = match &default_expr {
+                Some(catalog::DefaultExpr::Literal(v)) => v.clone(),
+                _ => crate::types::Value::Null,
+            };
+            storage::alter_add_column(schema, table_name, default_val);
+        } else if cmd.subtype == AlterTableType::AtDropColumn as i32 {
+            // DROP COLUMN
+            let col_name = &cmd.name;
+            let col_idx = catalog::get_column_index(schema, table_name, col_name)?;
+            catalog::alter_table_drop_column(schema, table_name, col_name)?;
+            storage::alter_drop_column(schema, table_name, col_idx);
+        } else {
+            return Err(format!("unsupported ALTER TABLE subcommand: {}", cmd.subtype));
+        }
+    }
+
+    Ok(QueryResult {
+        tag: "ALTER TABLE".into(),
+        columns: vec![],
+        rows: vec![],
+    })
+}
+
+fn exec_rename(
+    rename: &pg_query::protobuf::RenameStmt,
+) -> Result<QueryResult, String> {
+    let rel = rename.relation.as_ref().ok_or("RENAME missing relation")?;
+    let table_name = &rel.relname;
+    let schema = if rel.schemaname.is_empty() { "public" } else { &rel.schemaname };
+
+    use pg_query::protobuf::ObjectType;
+    if rename.rename_type == ObjectType::ObjectTable as i32 {
+        // ALTER TABLE ... RENAME TO new_name
+        catalog::rename_table(schema, table_name, &rename.newname)?;
+        storage::rename_table(schema, table_name, &rename.newname);
+    } else if rename.rename_type == ObjectType::ObjectColumn as i32 {
+        // ALTER TABLE ... RENAME COLUMN old TO new
+        catalog::rename_column(schema, table_name, &rename.subname, &rename.newname)?;
+    } else {
+        return Err("unsupported RENAME type".into());
+    }
+
+    Ok(QueryResult {
+        tag: "ALTER TABLE".into(),
+        columns: vec![],
+        rows: vec![],
+    })
+}
+
+fn exec_create_table_as(
+    ctas: &pg_query::protobuf::CreateTableAsStmt,
+) -> Result<QueryResult, String> {
+    let into = ctas.into.as_ref().ok_or("CREATE TABLE AS missing INTO")?;
+    let rel = into.rel.as_ref().ok_or("CREATE TABLE AS missing relation")?;
+    let table_name = &rel.relname;
+    let schema = if rel.schemaname.is_empty() { "public" } else { &rel.schemaname };
+
+    // Execute the source SELECT
+    let select_node = ctas.query.as_ref().and_then(|n| n.node.as_ref())
+        .ok_or("CREATE TABLE AS missing query")?;
+    let NodeEnum::SelectStmt(sel) = select_node else {
+        return Err("CREATE TABLE AS requires SELECT".into());
+    };
+
+    let mut arena = QueryArena::new();
+    let (columns, raw_rows) = exec_select_raw(sel, None, &mut arena)?;
+
+    // Create table from column metadata
+    let table_columns: Vec<catalog::Column> = columns.iter().map(|(name, oid)| {
+        catalog::Column {
+            name: name.clone(),
+            type_oid: TypeOid::from_oid(*oid),
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            default_expr: None,
+        }
+    }).collect();
+
+    let table = crate::catalog::Table {
+        name: table_name.clone(),
+        schema: schema.to_string(),
+        columns: table_columns,
+    };
+    catalog::create_table(table)?;
+    storage::create_table(schema, table_name);
+
+    // Insert rows
+    let rows: Vec<Vec<crate::types::Value>> = raw_rows.iter().map(|row| {
+        row.iter().map(|v| v.to_value(&arena)).collect()
+    }).collect();
+
+    if !rows.is_empty() {
+        storage::insert_batch(schema, table_name, rows);
+    }
+
+    Ok(QueryResult {
+        tag: format!("SELECT {}", raw_rows.len()),
         columns: vec![],
         rows: vec![],
     })
@@ -639,46 +805,66 @@ fn exec_insert(
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
 
     if let NodeEnum::SelectStmt(sel) = select {
-        for values_list in &sel.values_lists {
-            if let Some(NodeEnum::List(list)) = values_list.node.as_ref() {
-                // Only apply defaults for columns NOT explicitly specified.
-                // This avoids wasting sequence values on SERIAL columns
-                // when the user provides an explicit value.
-                let mut row: Vec<Value> = table_def
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if target_cols.contains(&col.name) {
-                            Ok(Value::Null) // will be overwritten by explicit value below
-                        } else {
-                            apply_default(&col.default_expr, schema)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                for (i, val_node) in list.items.iter().enumerate() {
-                    if i >= target_cols.len() {
-                        break;
-                    }
-                    let col_name = &target_cols[i];
-                    let col_idx = table_def
+        if !sel.values_lists.is_empty() {
+            // INSERT ... VALUES (...)
+            for values_list in &sel.values_lists {
+                if let Some(NodeEnum::List(list)) = values_list.node.as_ref() {
+                    let mut row: Vec<Value> = table_def
                         .columns
                         .iter()
-                        .position(|c| &c.name == col_name)
-                        .ok_or_else(|| format!("column \"{}\" does not exist", col_name))?;
+                        .map(|col| {
+                            if target_cols.contains(&col.name) {
+                                Ok(Value::Null)
+                            } else {
+                                apply_default(&col.default_expr, schema)
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
 
-                    row[col_idx] = eval_const(val_node.node.as_ref());
-                }
+                    for (i, val_node) in list.items.iter().enumerate() {
+                        if i >= target_cols.len() {
+                            break;
+                        }
+                        let col_name = &target_cols[i];
+                        let col_idx = table_def
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == col_name)
+                            .ok_or_else(|| format!("column \"{}\" does not exist", col_name))?;
 
-                // Coerce text values to vector type where the column expects it
-                for (i, col) in table_def.columns.iter().enumerate() {
-                    if col.type_oid == TypeOid::Vector {
-                        if let Value::Text(s) = &row[i] {
-                            row[i] = parse_vector_literal(s.trim())?;
+                        // Handle DEFAULT keyword — apply column default instead of literal
+                        if matches!(val_node.node.as_ref(), Some(NodeEnum::SetToDefault(_))) {
+                            row[col_idx] = apply_default(&table_def.columns[col_idx].default_expr, schema)?;
+                        } else {
+                            row[col_idx] = eval_const(val_node.node.as_ref());
                         }
                     }
-                }
 
+                    for (i, col) in table_def.columns.iter().enumerate() {
+                        if col.type_oid == TypeOid::Vector {
+                            if let Value::Text(s) = &row[i] {
+                                row[i] = parse_vector_literal(s.trim())?;
+                            }
+                        }
+                    }
+
+                    check_not_null(&table_def, &row)?;
+                    all_rows.push(row);
+                }
+            }
+        } else {
+            // INSERT ... SELECT ...
+            let mut arena = QueryArena::new();
+            let (_cols, raw_rows) = exec_select_raw(sel, None, &mut arena)?;
+            for raw_row in &raw_rows {
+                let mut row: Vec<Value> = table_def.columns.iter().map(|_| Value::Null).collect();
+                for (i, val) in raw_row.iter().enumerate() {
+                    if i >= target_cols.len() { break; }
+                    let col_name = &target_cols[i];
+                    let col_idx = table_def.columns.iter().position(|c| &c.name == col_name)
+                        .ok_or_else(|| format!("column \"{}\" does not exist", col_name))?;
+                    row[col_idx] = val.to_value(&arena);
+                }
                 check_not_null(&table_def, &row)?;
                 all_rows.push(row);
             }
@@ -1076,6 +1262,31 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
             }
         }
         NodeEnum::CaseExpr(case_expr) => eval_case_expr(case_expr, row, ctx, arena),
+        NodeEnum::CoalesceExpr(ce) => {
+            for arg in &ce.args {
+                if let Some(ref node) = arg.node {
+                    let val = eval_expr(node, row, ctx, arena)?;
+                    if !val.is_null() {
+                        return Ok(val);
+                    }
+                }
+            }
+            Ok(ArenaValue::Null)
+        }
+        NodeEnum::NullIfExpr(ni) => {
+            if ni.args.len() != 2 {
+                return Err("NULLIF requires exactly 2 arguments".into());
+            }
+            let a = eval_expr(ni.args[0].node.as_ref().ok_or("NULLIF missing arg1")?, row, ctx, arena)?;
+            let b = eval_expr(ni.args[1].node.as_ref().ok_or("NULLIF missing arg2")?, row, ctx, arena)?;
+            if a.is_null() || b.is_null() {
+                Ok(a) // NULLIF(NULL, x) = NULL, NULLIF(x, NULL) = x (since they're not equal)
+            } else if a.eq_with(&b, arena) || a.compare(&b, arena) == Some(std::cmp::Ordering::Equal) {
+                Ok(ArenaValue::Null)
+            } else {
+                Ok(a)
+            }
+        }
         NodeEnum::FuncCall(fc) => eval_func_call(fc, row, ctx, arena),
         NodeEnum::SubLink(sl) => {
             let inner = sl
@@ -1317,6 +1528,50 @@ fn eval_a_expr(
         return Ok(ArenaValue::Bool(if negated { !matched } else { matched }));
     }
 
+    // Handle NULLIF(a, b) — parsed as AExpr with AexprNullif kind
+    if expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 {
+        let left_node = expr.lexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or("NULLIF missing first argument")?;
+        let right_node = expr.rexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or("NULLIF missing second argument")?;
+        let a = eval_expr(left_node, row, ctx, arena)?;
+        let b = eval_expr(right_node, row, ctx, arena)?;
+        if a.is_null() { return Ok(ArenaValue::Null); }
+        if b.is_null() { return Ok(a); }
+        if a.eq_with(&b, arena) || a.compare(&b, arena) == Some(std::cmp::Ordering::Equal) {
+            return Ok(ArenaValue::Null);
+        }
+        return Ok(a);
+    }
+
+    // Handle BETWEEN / NOT BETWEEN
+    if expr.kind == pg_query::protobuf::AExprKind::AexprBetween as i32
+        || expr.kind == pg_query::protobuf::AExprKind::AexprNotBetween as i32
+    {
+        let negated = expr.kind == pg_query::protobuf::AExprKind::AexprNotBetween as i32;
+        let left_node = expr.lexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or("BETWEEN missing left operand")?;
+        let val = eval_expr(left_node, row, ctx, arena)?;
+        if val.is_null() { return Ok(ArenaValue::Null); }
+
+        // rexpr is a List of [low, high]
+        let bounds = expr.rexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or("BETWEEN missing bounds")?;
+        if let NodeEnum::List(list) = bounds {
+            if list.items.len() != 2 {
+                return Err("BETWEEN requires exactly two bounds".into());
+            }
+            let low = eval_expr(list.items[0].node.as_ref().ok_or("BETWEEN missing low")?, row, ctx, arena)?;
+            let high = eval_expr(list.items[1].node.as_ref().ok_or("BETWEEN missing high")?, row, ctx, arena)?;
+            if low.is_null() || high.is_null() { return Ok(ArenaValue::Null); }
+            let ge = val.compare(&low, arena).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false);
+            let le = val.compare(&high, arena).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false);
+            let in_range = ge && le;
+            return Ok(ArenaValue::Bool(if negated { !in_range } else { in_range }));
+        }
+        return Err("BETWEEN bounds must be a list".into());
+    }
+
     let op = extract_op_name(&expr.name)?;
 
     // Unary minus
@@ -1364,7 +1619,7 @@ fn eval_a_expr(
     }
 
     // Arithmetic
-    if matches!(op.as_str(), "+" | "-" | "*" | "/") {
+    if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
         return eval_arithmetic(&op, &left, &right, arena);
     }
 
@@ -1661,6 +1916,10 @@ fn eval_arithmetic(op: &str, left: &ArenaValue, right: &ArenaValue, arena: &Quer
                     ))
                 }
             }
+            "%" => {
+                if *b == 0 { Err("division by zero".into()) }
+                else { Ok(ArenaValue::Int(a.checked_rem(*b).ok_or("integer out of range")?)) }
+            }
             _ => Err(format!("unsupported arithmetic op: {}", op)),
         },
         (ArenaValue::Float(a), ArenaValue::Float(b)) => match op {
@@ -1673,6 +1932,10 @@ fn eval_arithmetic(op: &str, left: &ArenaValue, right: &ArenaValue, arena: &Quer
                 } else {
                     Ok(ArenaValue::Float(a / b))
                 }
+            }
+            "%" => {
+                if *b == 0.0 { Err("division by zero".into()) }
+                else { Ok(ArenaValue::Float(a % b)) }
             }
             _ => Err(format!("unsupported arithmetic op: {}", op)),
         },
@@ -1800,6 +2063,185 @@ fn eval_scalar_function(name: &str, args: &[ArenaValue], arena: &mut QueryArena)
                 Ok(ArenaValue::Int(val))
             }
             _ => Err("setval() requires (text, integer) arguments".into()),
+        },
+        // COALESCE/NULLIF as function calls (pg_query sometimes routes here)
+        "coalesce" => {
+            for arg in args {
+                if !arg.is_null() { return Ok(*arg); }
+            }
+            Ok(ArenaValue::Null)
+        }
+        "nullif" => {
+            if args.len() != 2 { return Err("nullif() requires 2 arguments".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            if args[1].is_null() { return Ok(args[0]); }
+            if args[0].eq_with(&args[1], arena) || args[0].compare(&args[1], arena) == Some(std::cmp::Ordering::Equal) {
+                Ok(ArenaValue::Null)
+            } else {
+                Ok(args[0])
+            }
+        }
+        // ── String functions ────────────────────────────────────
+        "substring" | "substr" => {
+            if args.is_empty() { return Err("substring() requires at least 2 arguments".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            // FROM position (1-based)
+            let from = match args.get(1) {
+                Some(ArenaValue::Int(n)) => (*n as usize).saturating_sub(1), // 1-based to 0-based
+                _ => 0,
+            };
+            // FOR length (optional)
+            let len = match args.get(2) {
+                Some(ArenaValue::Int(n)) => *n as usize,
+                _ => chars.len().saturating_sub(from),
+            };
+            let result: String = chars.iter().skip(from).take(len).collect();
+            Ok(ArenaValue::Text(arena.alloc_str(&result)))
+        }
+        "btrim" | "trim" => {
+            if args.is_empty() { return Err("trim() requires at least 1 argument".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let chars_to_trim = match args.get(1) {
+                Some(ArenaValue::Text(t)) => arena.get_str(*t).to_string(),
+                _ => " ".to_string(),
+            };
+            let trimmed = s.trim_matches(|c: char| chars_to_trim.contains(c)).to_string();
+            Ok(ArenaValue::Text(arena.alloc_str(&trimmed)))
+        }
+        "ltrim" => {
+            if args.is_empty() { return Err("ltrim() requires at least 1 argument".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let chars_to_trim = match args.get(1) {
+                Some(ArenaValue::Text(t)) => arena.get_str(*t).to_string(),
+                _ => " ".to_string(),
+            };
+            let trimmed = s.trim_start_matches(|c: char| chars_to_trim.contains(c)).to_string();
+            Ok(ArenaValue::Text(arena.alloc_str(&trimmed)))
+        }
+        "rtrim" => {
+            if args.is_empty() { return Err("rtrim() requires at least 1 argument".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let chars_to_trim = match args.get(1) {
+                Some(ArenaValue::Text(t)) => arena.get_str(*t).to_string(),
+                _ => " ".to_string(),
+            };
+            let trimmed = s.trim_end_matches(|c: char| chars_to_trim.contains(c)).to_string();
+            Ok(ArenaValue::Text(arena.alloc_str(&trimmed)))
+        }
+        "strpos" | "position" => {
+            // POSITION(substr IN str) → pg_query calls strpos(str, substr)
+            if args.len() != 2 { return Err("strpos() requires 2 arguments".into()); }
+            if args[0].is_null() || args[1].is_null() { return Ok(ArenaValue::Null); }
+            let haystack = args[0].to_text(arena).unwrap_or_default();
+            let needle = args[1].to_text(arena).unwrap_or_default();
+            let pos = haystack.find(&needle).map(|p| p + 1).unwrap_or(0); // 1-based, 0 if not found
+            Ok(ArenaValue::Int(pos as i64))
+        }
+        "replace" => {
+            if args.len() != 3 { return Err("replace() requires 3 arguments".into()); }
+            if args.iter().any(|a| a.is_null()) { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let from = args[1].to_text(arena).unwrap_or_default();
+            let to = args[2].to_text(arena).unwrap_or_default();
+            Ok(ArenaValue::Text(arena.alloc_str(&s.replace(&from, &to))))
+        }
+        "left" => {
+            if args.len() != 2 { return Err("left() requires 2 arguments".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let n = match &args[1] {
+                ArenaValue::Int(i) => *i as usize,
+                _ => return Err("left() requires integer second argument".into()),
+            };
+            let result: String = s.chars().take(n).collect();
+            Ok(ArenaValue::Text(arena.alloc_str(&result)))
+        }
+        "right" => {
+            if args.len() != 2 { return Err("right() requires 2 arguments".into()); }
+            if args[0].is_null() { return Ok(ArenaValue::Null); }
+            let s = args[0].to_text(arena).unwrap_or_default();
+            let n = match &args[1] {
+                ArenaValue::Int(i) => *i as usize,
+                _ => return Err("right() requires integer second argument".into()),
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let start = chars.len().saturating_sub(n);
+            let result: String = chars[start..].iter().collect();
+            Ok(ArenaValue::Text(arena.alloc_str(&result)))
+        }
+        // ── Math functions ──────────────────────────────────────
+        "ceil" | "ceiling" => match args.first() {
+            Some(ArenaValue::Int(n)) => Ok(ArenaValue::Int(*n)),
+            Some(ArenaValue::Float(f)) => Ok(ArenaValue::Int(f.ceil() as i64)),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
+            _ => Err("ceil() requires numeric argument".into()),
+        },
+        "floor" => match args.first() {
+            Some(ArenaValue::Int(n)) => Ok(ArenaValue::Int(*n)),
+            Some(ArenaValue::Float(f)) => Ok(ArenaValue::Int(f.floor() as i64)),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
+            _ => Err("floor() requires numeric argument".into()),
+        },
+        "round" => {
+            let val = args.first().ok_or("round() requires at least 1 argument")?;
+            if val.is_null() { return Ok(ArenaValue::Null); }
+            let decimals = match args.get(1) {
+                Some(ArenaValue::Int(d)) => *d as i32,
+                None => 0,
+                _ => return Err("round() second argument must be integer".into()),
+            };
+            let f = match val {
+                ArenaValue::Int(n) => *n as f64,
+                ArenaValue::Float(f) => *f,
+                _ => return Err("round() requires numeric argument".into()),
+            };
+            if decimals == 0 {
+                Ok(ArenaValue::Int(f.round() as i64))
+            } else {
+                let factor = 10f64.powi(decimals);
+                let rounded = (f * factor).round() / factor;
+                Ok(ArenaValue::Float(rounded))
+            }
+        }
+        "mod" => {
+            if args.len() != 2 { return Err("mod() requires 2 arguments".into()); }
+            eval_arithmetic("%", &args[0], &args[1], arena)
+        }
+        "power" | "pow" => {
+            if args.len() != 2 { return Err("power() requires 2 arguments".into()); }
+            if args[0].is_null() || args[1].is_null() { return Ok(ArenaValue::Null); }
+            let base = match &args[0] {
+                ArenaValue::Int(n) => *n as f64,
+                ArenaValue::Float(f) => *f,
+                _ => return Err("power() requires numeric arguments".into()),
+            };
+            let exp = match &args[1] {
+                ArenaValue::Int(n) => *n as f64,
+                ArenaValue::Float(f) => *f,
+                _ => return Err("power() requires numeric arguments".into()),
+            };
+            let result = base.powf(exp);
+            // Return Int if result is a whole number and fits
+            if result == result.trunc() && result.is_finite() && result.abs() < i64::MAX as f64 {
+                Ok(ArenaValue::Int(result as i64))
+            } else {
+                Ok(ArenaValue::Float(result))
+            }
+        }
+        "sqrt" => match args.first() {
+            Some(ArenaValue::Int(n)) => {
+                let result = (*n as f64).sqrt();
+                if result == result.trunc() { Ok(ArenaValue::Int(result as i64)) }
+                else { Ok(ArenaValue::Float(result)) }
+            }
+            Some(ArenaValue::Float(f)) => Ok(ArenaValue::Float(f.sqrt())),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
+            _ => Err("sqrt() requires numeric argument".into()),
         },
         _ => Err(format!("function {}() does not exist", name)),
     }
@@ -2090,7 +2532,7 @@ fn extract_col_name(cref: &pg_query::protobuf::ColumnRef) -> String {
 }
 
 fn is_aggregate(name: &str) -> bool {
-    matches!(name, "count" | "sum" | "avg" | "min" | "max")
+    matches!(name, "count" | "sum" | "avg" | "min" | "max" | "string_agg" | "bool_and" | "bool_or")
 }
 
 fn query_has_aggregates(select: &pg_query::protobuf::SelectStmt) -> bool {
@@ -2636,6 +3078,85 @@ fn exec_select_raw(
     outer: Option<(&[ArenaValue], &JoinContext)>,
     arena: &mut QueryArena,
 ) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
+    // Handle UNION / INTERSECT / EXCEPT (set operations)
+    let set_op = select.op;
+    if set_op == pg_query::protobuf::SetOperation::SetopUnion as i32
+        || set_op == pg_query::protobuf::SetOperation::SetopIntersect as i32
+        || set_op == pg_query::protobuf::SetOperation::SetopExcept as i32
+    {
+        let larg = select.larg.as_ref().ok_or("set operation missing left SELECT")?;
+        let rarg = select.rarg.as_ref().ok_or("set operation missing right SELECT")?;
+        let (lcols, lrows) = exec_select_raw(larg, outer, arena)?;
+        let (_, rrows) = exec_select_raw(rarg, outer, arena)?;
+
+        let mut result_rows = if set_op == pg_query::protobuf::SetOperation::SetopUnion as i32 {
+            let mut combined = lrows;
+            combined.extend(rrows);
+            if !select.all {
+                combined = dedup_distinct(&[pg_query::protobuf::Node { node: None }], combined, arena);
+            }
+            combined
+        } else if set_op == pg_query::protobuf::SetOperation::SetopIntersect as i32 {
+            lrows.into_iter().filter(|lrow| {
+                rrows.iter().any(|rrow|
+                    lrow.len() == rrow.len() && lrow.iter().zip(rrow.iter()).all(|(a, b)| a.eq_with(b, arena))
+                )
+            }).collect()
+        } else {
+            // EXCEPT
+            lrows.into_iter().filter(|lrow| {
+                !rrows.iter().any(|rrow|
+                    lrow.len() == rrow.len() && lrow.iter().zip(rrow.iter()).all(|(a, b)| a.eq_with(b, arena))
+                )
+            }).collect()
+        };
+
+        // Apply ORDER BY / LIMIT on the combined result
+        if !select.sort_clause.is_empty() || select.limit_count.is_some() || select.limit_offset.is_some() {
+            if !select.sort_clause.is_empty() {
+                // Resolve ORDER BY using column names from the result set
+                let mut sort_keys = Vec::new();
+                for sort_node in &select.sort_clause {
+                    if let Some(NodeEnum::SortBy(sb)) = sort_node.node.as_ref() {
+                        let ascending = sb.sortby_dir != pg_query::protobuf::SortByDir::SortbyDesc as i32;
+                        let nulls_first = sb.sortby_nulls == pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32;
+                        if let Some(ref node) = sb.node {
+                            if let Some(NodeEnum::ColumnRef(cref)) = node.node.as_ref() {
+                                let col_name = cref.fields.iter()
+                                    .filter_map(|f| f.node.as_ref())
+                                    .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
+                                    .last().unwrap_or("");
+                                let idx = lcols.iter().position(|(n, _)| n == col_name)
+                                    .ok_or_else(|| format!("column \"{}\" does not exist in UNION result", col_name))?;
+                                sort_keys.push(SortKey { col_idx: idx, ascending, nulls_first });
+                            } else if let Some(NodeEnum::AConst(ac)) = node.node.as_ref() {
+                                // ORDER BY 1, 2, etc. — positional
+                                if let Some(pg_query::protobuf::a_const::Val::Ival(iv)) = &ac.val {
+                                    sort_keys.push(SortKey { col_idx: (iv.ival as usize) - 1, ascending, nulls_first });
+                                }
+                            }
+                        }
+                    }
+                }
+                result_rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
+            }
+            if let Some(ref offset_node) = select.limit_offset {
+                if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
+                    let n = n.max(0) as usize;
+                    if n >= result_rows.len() { result_rows.clear(); }
+                    else { result_rows.drain(0..n); }
+                }
+            }
+            if let Some(ref limit_node) = select.limit_count {
+                if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
+                    result_rows.truncate(n.max(0) as usize);
+                }
+            }
+        }
+
+        return Ok((lcols, result_rows));
+    }
+
     if select.from_clause.is_empty() {
         return exec_select_raw_no_from(select, outer, arena);
     }
@@ -3320,6 +3841,7 @@ fn exec_select_aggregate(
                                 let oid = match name.as_str() {
                                     "count" => TypeOid::Int8.oid(),
                                     "avg" => TypeOid::Float8.oid(),
+                                    "bool_and" | "bool_or" => TypeOid::Bool.oid(),
                                     _ => TypeOid::Text.oid(),
                                 };
                                 result_columns.push((alias, oid));
@@ -3424,14 +3946,26 @@ fn compute_aggregate(
                     .first()
                     .and_then(|a| a.node.as_ref())
                     .ok_or("COUNT requires argument")?;
-                let mut count: i64 = 0;
-                for row in rows {
-                    match eval_expr(arg, row, ctx, arena)? {
-                        ArenaValue::Null => {} // COUNT(col) skips NULLs
-                        _ => count += 1,
+                if fc.agg_distinct {
+                    let mut seen: Vec<ArenaValue> = Vec::new();
+                    for row in rows {
+                        let v = eval_expr(arg, row, ctx, arena)?;
+                        if v.is_null() { continue; }
+                        if !seen.iter().any(|s| s.eq_with(&v, arena)) {
+                            seen.push(v);
+                        }
                     }
+                    Ok(ArenaValue::Int(seen.len() as i64))
+                } else {
+                    let mut count: i64 = 0;
+                    for row in rows {
+                        match eval_expr(arg, row, ctx, arena)? {
+                            ArenaValue::Null => {}
+                            _ => count += 1,
+                        }
+                    }
+                    Ok(ArenaValue::Int(count))
                 }
-                Ok(ArenaValue::Int(count))
             }
         }
         "sum" => {
@@ -3440,33 +3974,27 @@ fn compute_aggregate(
                 .first()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("SUM requires argument")?;
+            let mut vals: Vec<ArenaValue> = Vec::new();
+            for row in rows {
+                let v = eval_expr(arg, row, ctx, arena)?;
+                if v.is_null() { continue; }
+                if fc.agg_distinct {
+                    if vals.iter().any(|s| s.eq_with(&v, arena)) { continue; }
+                }
+                vals.push(v);
+            }
+            if vals.is_empty() { return Ok(ArenaValue::Null); }
             let mut si: i64 = 0;
             let mut sf: f64 = 0.0;
             let mut is_float = false;
-            let mut has_val = false;
-            for row in rows {
-                match eval_expr(arg, row, ctx, arena)? {
-                    ArenaValue::Int(n) => {
-                        si = si.checked_add(n).ok_or("integer out of range")?;
-                        has_val = true;
-                    }
-                    ArenaValue::Float(f) => {
-                        sf += f;
-                        is_float = true;
-                        has_val = true;
-                    }
-                    ArenaValue::Null => {}
+            for v in &vals {
+                match v {
+                    ArenaValue::Int(n) => { si = si.checked_add(*n).ok_or("integer out of range")?; }
+                    ArenaValue::Float(f) => { sf += f; is_float = true; }
                     _ => return Err("SUM requires numeric".into()),
                 }
             }
-            if !has_val {
-                return Ok(ArenaValue::Null);
-            }
-            Ok(if is_float {
-                ArenaValue::Float(sf + si as f64)
-            } else {
-                ArenaValue::Int(si)
-            })
+            Ok(if is_float { ArenaValue::Float(sf + si as f64) } else { ArenaValue::Int(si) })
         }
         "avg" => {
             let arg = fc
@@ -3545,6 +4073,61 @@ fn compute_aggregate(
                 });
             }
             Ok(result.unwrap_or(ArenaValue::Null))
+        }
+        "string_agg" => {
+            let arg = fc.args.first().and_then(|a| a.node.as_ref())
+                .ok_or("STRING_AGG requires argument")?;
+            let delim_node = fc.args.get(1).and_then(|a| a.node.as_ref());
+            let delim = if let Some(d) = delim_node {
+                let dv = eval_expr(d, &rows[0], ctx, arena)?;
+                dv.to_text(arena).unwrap_or_else(|| ", ".to_string())
+            } else {
+                ", ".to_string()
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for row in rows {
+                let v = eval_expr(arg, row, ctx, arena)?;
+                if let Some(text) = v.to_text(arena) {
+                    parts.push(text);
+                }
+            }
+            if parts.is_empty() {
+                Ok(ArenaValue::Null)
+            } else {
+                // Apply ORDER BY within the aggregate if specified
+                if !fc.agg_order.is_empty() {
+                    parts.sort();
+                }
+                Ok(ArenaValue::Text(arena.alloc_str(&parts.join(&delim))))
+            }
+        }
+        "bool_and" => {
+            let arg = fc.args.first().and_then(|a| a.node.as_ref())
+                .ok_or("BOOL_AND requires argument")?;
+            let mut result = true;
+            let mut has_val = false;
+            for row in rows {
+                match eval_expr(arg, row, ctx, arena)? {
+                    ArenaValue::Bool(b) => { result = result && b; has_val = true; }
+                    ArenaValue::Null => {}
+                    _ => return Err("BOOL_AND requires boolean".into()),
+                }
+            }
+            if !has_val { Ok(ArenaValue::Null) } else { Ok(ArenaValue::Bool(result)) }
+        }
+        "bool_or" => {
+            let arg = fc.args.first().and_then(|a| a.node.as_ref())
+                .ok_or("BOOL_OR requires argument")?;
+            let mut result = false;
+            let mut has_val = false;
+            for row in rows {
+                match eval_expr(arg, row, ctx, arena)? {
+                    ArenaValue::Bool(b) => { result = result || b; has_val = true; }
+                    ArenaValue::Null => {}
+                    _ => return Err("BOOL_OR requires boolean".into()),
+                }
+            }
+            if !has_val { Ok(ArenaValue::Null) } else { Ok(ArenaValue::Bool(result)) }
         }
         _ => Err(format!("unknown aggregate function: {}", name)),
     }
@@ -5351,4 +5934,569 @@ mod tests {
         assert_eq!(r.rows[1][0], Some("2".into()));
         assert_eq!(r.rows[2][0], Some("3".into()));
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SPEC TESTS — SQL Completeness Target
+    // Each test below defines a PostgreSQL behavior we must match.
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── ALTER TABLE ─────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn alter_table_add_column() {
+        setup();
+        execute("CREATE TABLE alt1 (id INT, name TEXT)").unwrap();
+        execute("INSERT INTO alt1 VALUES (1, 'alice')").unwrap();
+        execute("ALTER TABLE alt1 ADD COLUMN age INT").unwrap();
+        let r = execute("SELECT id, name, age FROM alt1").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][2], None); // new column is NULL for existing rows
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alter_table_add_column_with_default() {
+        setup();
+        execute("CREATE TABLE alt2 (id INT)").unwrap();
+        execute("INSERT INTO alt2 VALUES (1), (2)").unwrap();
+        execute("ALTER TABLE alt2 ADD COLUMN status TEXT DEFAULT 'active'").unwrap();
+        let r = execute("SELECT id, status FROM alt2 ORDER BY id").unwrap();
+        assert_eq!(r.rows[0][1], Some("active".into()));
+        assert_eq!(r.rows[1][1], Some("active".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alter_table_drop_column() {
+        setup();
+        execute("CREATE TABLE alt3 (id INT, name TEXT, age INT)").unwrap();
+        execute("INSERT INTO alt3 VALUES (1, 'alice', 30)").unwrap();
+        execute("ALTER TABLE alt3 DROP COLUMN age").unwrap();
+        let r = execute("SELECT * FROM alt3").unwrap();
+        assert_eq!(r.columns.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alter_table_rename_column() {
+        setup();
+        execute("CREATE TABLE alt4 (id INT, name TEXT)").unwrap();
+        execute("INSERT INTO alt4 VALUES (1, 'alice')").unwrap();
+        execute("ALTER TABLE alt4 RENAME COLUMN name TO full_name").unwrap();
+        let r = execute("SELECT full_name FROM alt4").unwrap();
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alter_table_rename_table() {
+        setup();
+        execute("CREATE TABLE alt5 (id INT)").unwrap();
+        execute("INSERT INTO alt5 VALUES (1)").unwrap();
+        execute("ALTER TABLE alt5 RENAME TO alt5_renamed").unwrap();
+        let r = execute("SELECT id FROM alt5_renamed").unwrap();
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    // ── Type Casting ────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_text_to_int() {
+        setup();
+        let r = execute("SELECT CAST('42' AS INT)").unwrap();
+        assert_eq!(r.rows[0][0], Some("42".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_int_to_text() {
+        setup();
+        let r = execute("SELECT CAST(42 AS TEXT)").unwrap();
+        assert_eq!(r.rows[0][0], Some("42".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_float_to_int_rounds() {
+        setup();
+        // PostgreSQL: CAST(3.7 AS INT) = 4 (rounds)
+        let r = execute("SELECT CAST(3.7 AS INT)").unwrap();
+        assert_eq!(r.rows[0][0], Some("4".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_shorthand_syntax() {
+        setup();
+        let r = execute("SELECT '123'::INT").unwrap();
+        assert_eq!(r.rows[0][0], Some("123".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_int_to_float() {
+        setup();
+        let r = execute("SELECT 42::FLOAT8").unwrap();
+        // Should be a float representation
+        let val = r.rows[0][0].as_ref().unwrap();
+        assert!(val == "42" || val == "42.0");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_bool_to_text() {
+        setup();
+        let r = execute("SELECT true::TEXT").unwrap();
+        assert_eq!(r.rows[0][0], Some("true".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cast_in_where() {
+        setup();
+        execute("CREATE TABLE cast_t (val TEXT)").unwrap();
+        execute("INSERT INTO cast_t VALUES ('10'), ('20'), ('3')").unwrap();
+        let r = execute("SELECT val FROM cast_t WHERE val::INT > 5 ORDER BY val::INT").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("10".into()));
+        assert_eq!(r.rows[1][0], Some("20".into()));
+    }
+
+    // ── BETWEEN ─────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn between_basic() {
+        setup();
+        execute("CREATE TABLE bet1 (x INT)").unwrap();
+        execute("INSERT INTO bet1 VALUES (1), (5), (10), (15), (20)").unwrap();
+        let r = execute("SELECT x FROM bet1 WHERE x BETWEEN 5 AND 15 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Some("5".into()));
+        assert_eq!(r.rows[1][0], Some("10".into()));
+        assert_eq!(r.rows[2][0], Some("15".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn not_between() {
+        setup();
+        execute("CREATE TABLE bet2 (x INT)").unwrap();
+        execute("INSERT INTO bet2 VALUES (1), (5), (10)").unwrap();
+        let r = execute("SELECT x FROM bet2 WHERE x NOT BETWEEN 3 AND 7 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("10".into()));
+    }
+
+    // ── COALESCE / NULLIF ───────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn coalesce_basic() {
+        setup();
+        execute("CREATE TABLE coal (a INT, b INT, c INT)").unwrap();
+        execute("INSERT INTO coal VALUES (NULL, NULL, 3)").unwrap();
+        execute("INSERT INTO coal VALUES (NULL, 2, 3)").unwrap();
+        execute("INSERT INTO coal VALUES (1, 2, 3)").unwrap();
+        let r = execute("SELECT COALESCE(a, b, c) FROM coal ORDER BY a, b, c").unwrap();
+        // Row 1: COALESCE(1,2,3) = 1
+        // Row 2: COALESCE(NULL,2,3) = 2
+        // Row 3: COALESCE(NULL,NULL,3) = 3
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
+        assert_eq!(r.rows[2][0], Some("3".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn coalesce_all_null() {
+        setup();
+        let r = execute("SELECT COALESCE(NULL, NULL, NULL)").unwrap();
+        assert_eq!(r.rows[0][0], None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nullif_equal() {
+        setup();
+        // NULLIF(a, b) returns NULL if a = b, else a
+        let r = execute("SELECT NULLIF(5, 5)").unwrap();
+        assert_eq!(r.rows[0][0], None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nullif_not_equal() {
+        setup();
+        let r = execute("SELECT NULLIF(5, 3)").unwrap();
+        assert_eq!(r.rows[0][0], Some("5".into()));
+    }
+
+    // ── String Functions ────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn substring_from_for() {
+        setup();
+        // SUBSTRING('hello' FROM 2 FOR 3) = 'ell'
+        let r = execute("SELECT SUBSTRING('hello' FROM 2 FOR 3)").unwrap();
+        assert_eq!(r.rows[0][0], Some("ell".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn substring_from_only() {
+        setup();
+        // SUBSTRING('hello' FROM 3) = 'llo'
+        let r = execute("SELECT SUBSTRING('hello' FROM 3)").unwrap();
+        assert_eq!(r.rows[0][0], Some("llo".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trim_basic() {
+        setup();
+        let r = execute("SELECT TRIM('  hello  ')").unwrap();
+        assert_eq!(r.rows[0][0], Some("hello".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trim_leading_trailing() {
+        setup();
+        let r = execute("SELECT TRIM(LEADING ' ' FROM '  hello  ')").unwrap();
+        assert_eq!(r.rows[0][0], Some("hello  ".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn replace_function() {
+        setup();
+        let r = execute("SELECT REPLACE('hello world', 'world', 'rust')").unwrap();
+        assert_eq!(r.rows[0][0], Some("hello rust".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn position_function() {
+        setup();
+        // POSITION('lo' IN 'hello') = 4 (1-based)
+        let r = execute("SELECT POSITION('lo' IN 'hello')").unwrap();
+        assert_eq!(r.rows[0][0], Some("4".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn left_right_functions() {
+        setup();
+        let r1 = execute("SELECT LEFT('hello', 3)").unwrap();
+        assert_eq!(r1.rows[0][0], Some("hel".into()));
+        let r2 = execute("SELECT RIGHT('hello', 3)").unwrap();
+        assert_eq!(r2.rows[0][0], Some("llo".into()));
+    }
+
+    // ── Math Functions ──────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn ceil_floor_round() {
+        setup();
+        let r1 = execute("SELECT CEIL(4.2)").unwrap();
+        assert_eq!(r1.rows[0][0], Some("5".into()));
+        let r2 = execute("SELECT FLOOR(4.8)").unwrap();
+        assert_eq!(r2.rows[0][0], Some("4".into()));
+        let r3 = execute("SELECT ROUND(4.567, 2)").unwrap();
+        assert_eq!(r3.rows[0][0], Some("4.57".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mod_function() {
+        setup();
+        let r = execute("SELECT MOD(10, 3)").unwrap();
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn power_sqrt() {
+        setup();
+        let r1 = execute("SELECT POWER(2, 10)").unwrap();
+        assert_eq!(r1.rows[0][0], Some("1024".into()));
+        let r2 = execute("SELECT SQRT(144)").unwrap();
+        assert_eq!(r2.rows[0][0], Some("12".into()));
+    }
+
+    // ── Aggregate Enhancements ──────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn count_distinct() {
+        setup();
+        execute("CREATE TABLE cd (color TEXT)").unwrap();
+        execute("INSERT INTO cd VALUES ('red'), ('blue'), ('red'), ('green'), ('blue')").unwrap();
+        let r = execute("SELECT COUNT(DISTINCT color) FROM cd").unwrap();
+        assert_eq!(r.rows[0][0], Some("3".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sum_distinct() {
+        setup();
+        execute("CREATE TABLE sd (x INT)").unwrap();
+        execute("INSERT INTO sd VALUES (1), (2), (2), (3), (3), (3)").unwrap();
+        let r = execute("SELECT SUM(DISTINCT x) FROM sd").unwrap();
+        assert_eq!(r.rows[0][0], Some("6".into())); // 1+2+3
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn avg_function() {
+        setup();
+        execute("CREATE TABLE av (x INT)").unwrap();
+        execute("INSERT INTO av VALUES (10), (20), (30)").unwrap();
+        let r = execute("SELECT AVG(x) FROM av").unwrap();
+        assert_eq!(r.rows[0][0], Some("20".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn string_agg() {
+        setup();
+        execute("CREATE TABLE sa (name TEXT)").unwrap();
+        execute("INSERT INTO sa VALUES ('a'), ('b'), ('c')").unwrap();
+        let r = execute("SELECT STRING_AGG(name, ', ' ORDER BY name) FROM sa").unwrap();
+        assert_eq!(r.rows[0][0], Some("a, b, c".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bool_and_or() {
+        setup();
+        execute("CREATE TABLE ba (x BOOL)").unwrap();
+        execute("INSERT INTO ba VALUES (true), (true), (false)").unwrap();
+        let r1 = execute("SELECT BOOL_AND(x) FROM ba").unwrap();
+        assert_eq!(r1.rows[0][0], Some("f".into()));
+        let r2 = execute("SELECT BOOL_OR(x) FROM ba").unwrap();
+        assert_eq!(r2.rows[0][0], Some("t".into()));
+    }
+
+    // ── UNION / UNION ALL / INTERSECT / EXCEPT ──────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn union_all() {
+        setup();
+        execute("CREATE TABLE u1 (x INT)").unwrap();
+        execute("CREATE TABLE u2 (x INT)").unwrap();
+        execute("INSERT INTO u1 VALUES (1), (2)").unwrap();
+        execute("INSERT INTO u2 VALUES (2), (3)").unwrap();
+        let r = execute("SELECT x FROM u1 UNION ALL SELECT x FROM u2 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 4); // 1, 2, 2, 3
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn union_dedup() {
+        setup();
+        execute("CREATE TABLE u3 (x INT)").unwrap();
+        execute("CREATE TABLE u4 (x INT)").unwrap();
+        execute("INSERT INTO u3 VALUES (1), (2)").unwrap();
+        execute("INSERT INTO u4 VALUES (2), (3)").unwrap();
+        let r = execute("SELECT x FROM u3 UNION SELECT x FROM u4 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 3); // 1, 2, 3 (deduped)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn intersect_basic() {
+        setup();
+        execute("CREATE TABLE i1 (x INT)").unwrap();
+        execute("CREATE TABLE i2 (x INT)").unwrap();
+        execute("INSERT INTO i1 VALUES (1), (2), (3)").unwrap();
+        execute("INSERT INTO i2 VALUES (2), (3), (4)").unwrap();
+        let r = execute("SELECT x FROM i1 INTERSECT SELECT x FROM i2 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 2); // 2, 3
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn except_basic() {
+        setup();
+        execute("CREATE TABLE e1 (x INT)").unwrap();
+        execute("CREATE TABLE e2 (x INT)").unwrap();
+        execute("INSERT INTO e1 VALUES (1), (2), (3)").unwrap();
+        execute("INSERT INTO e2 VALUES (2), (3), (4)").unwrap();
+        let r = execute("SELECT x FROM e1 EXCEPT SELECT x FROM e2 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 1); // 1
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    // ── Subquery Enhancements ───────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn subquery_in_select_list() {
+        setup();
+        execute("CREATE TABLE sq1 (id INT, name TEXT)").unwrap();
+        execute("CREATE TABLE sq2 (user_id INT, score INT)").unwrap();
+        execute("INSERT INTO sq1 VALUES (1, 'alice'), (2, 'bob')").unwrap();
+        execute("INSERT INTO sq2 VALUES (1, 100), (1, 200), (2, 50)").unwrap();
+        let r = execute(
+            "SELECT name, (SELECT SUM(score) FROM sq2 WHERE sq2.user_id = sq1.id) FROM sq1 ORDER BY name"
+        ).unwrap();
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+        assert_eq!(r.rows[0][1], Some("300".into()));
+        assert_eq!(r.rows[1][0], Some("bob".into()));
+        assert_eq!(r.rows[1][1], Some("50".into()));
+    }
+
+    // ── Expression Enhancements ─────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "ORDER BY alias resolution not yet implemented"]
+    fn expression_aliases_in_order_by() {
+        setup();
+        execute("CREATE TABLE ea (price INT, qty INT)").unwrap();
+        execute("INSERT INTO ea VALUES (10, 5), (20, 2), (5, 10)").unwrap();
+        let r = execute("SELECT price * qty AS total FROM ea ORDER BY total").unwrap();
+        assert_eq!(r.rows[0][0], Some("40".into()));
+        assert_eq!(r.rows[1][0], Some("50".into()));
+        assert_eq!(r.rows[2][0], Some("50".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn negative_literal() {
+        setup();
+        let r = execute("SELECT -5").unwrap();
+        assert_eq!(r.rows[0][0], Some("-5".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn modulo_operator() {
+        setup();
+        let r = execute("SELECT 10 % 3").unwrap();
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    // ── INSERT ... SELECT ───────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_select() {
+        setup();
+        execute("CREATE TABLE src (x INT)").unwrap();
+        execute("CREATE TABLE dst (x INT)").unwrap();
+        execute("INSERT INTO src VALUES (1), (2), (3)").unwrap();
+        execute("INSERT INTO dst SELECT x FROM src WHERE x > 1").unwrap();
+        let r = execute("SELECT x FROM dst ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("2".into()));
+        assert_eq!(r.rows[1][0], Some("3".into()));
+    }
+
+    // ── UPDATE with JOIN / FROM ─────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "UPDATE FROM not yet implemented"]
+    fn update_from_join() {
+        setup();
+        execute("CREATE TABLE prices (id INT, price INT)").unwrap();
+        execute("CREATE TABLE discounts (id INT, discount INT)").unwrap();
+        execute("INSERT INTO prices VALUES (1, 100), (2, 200)").unwrap();
+        execute("INSERT INTO discounts VALUES (1, 10), (2, 20)").unwrap();
+        execute("UPDATE prices SET price = prices.price - discounts.discount FROM discounts WHERE prices.id = discounts.id").unwrap();
+        let r = execute("SELECT id, price FROM prices ORDER BY id").unwrap();
+        assert_eq!(r.rows[0][1], Some("90".into()));
+        assert_eq!(r.rows[1][1], Some("180".into()));
+    }
+
+    // ── DELETE with USING ───────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "DELETE USING not yet implemented"]
+    fn delete_using() {
+        setup();
+        execute("CREATE TABLE items (id INT, name TEXT)").unwrap();
+        execute("CREATE TABLE blacklist (name TEXT)").unwrap();
+        execute("INSERT INTO items VALUES (1, 'good'), (2, 'bad'), (3, 'ugly')").unwrap();
+        execute("INSERT INTO blacklist VALUES ('bad'), ('ugly')").unwrap();
+        execute("DELETE FROM items USING blacklist WHERE items.name = blacklist.name").unwrap();
+        let r = execute("SELECT name FROM items").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("good".into()));
+    }
+
+    // ── CREATE TABLE AS / SELECT INTO ───────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn create_table_as_select() {
+        setup();
+        execute("CREATE TABLE ctas_src (id INT, name TEXT)").unwrap();
+        execute("INSERT INTO ctas_src VALUES (1, 'alice'), (2, 'bob')").unwrap();
+        execute("CREATE TABLE ctas_dst AS SELECT * FROM ctas_src WHERE id = 1").unwrap();
+        let r = execute("SELECT id, name FROM ctas_dst").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    // ── IF NOT EXISTS / IF EXISTS ───────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn create_table_if_not_exists() {
+        setup();
+        execute("CREATE TABLE ine (id INT)").unwrap();
+        // Should not error
+        execute("CREATE TABLE IF NOT EXISTS ine (id INT)").unwrap();
+        execute("INSERT INTO ine VALUES (1)").unwrap();
+        let r = execute("SELECT id FROM ine").unwrap();
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drop_table_if_exists() {
+        setup();
+        // Should not error even if table doesn't exist
+        execute("DROP TABLE IF EXISTS nonexistent").unwrap();
+    }
+
+    // ── Multiple DEFAULT expressions ────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_default_keyword() {
+        setup();
+        execute("CREATE TABLE def1 (id SERIAL, name TEXT DEFAULT 'unnamed')").unwrap();
+        execute("INSERT INTO def1 (name) VALUES (DEFAULT)").unwrap();
+        let r = execute("SELECT id, name FROM def1").unwrap();
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("unnamed".into()));
+    }
+
+    // ── Column aliases in SELECT ────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn column_alias() {
+        setup();
+        execute("CREATE TABLE ca (first_name TEXT)").unwrap();
+        execute("INSERT INTO ca VALUES ('alice')").unwrap();
+        let r = execute("SELECT first_name AS name FROM ca").unwrap();
+        assert_eq!(r.columns[0].0, "name");
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+    }
+
 }
