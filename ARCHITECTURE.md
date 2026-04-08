@@ -1,15 +1,15 @@
-# pgRx Architecture Principles
+# EvolvSQL Architecture Principles
 
 > Every allocation is a cost. Every pointer is pressure. Every copy is waste.
 > — Inspired by VictoriaMetrics' zero-allocation philosophy
 
-This document defines the architectural principles that govern ALL implementation decisions in pgRx. Every PR, every new feature, every refactor must align with these principles.
+This document defines the architectural principles that govern ALL implementation decisions in EvolvSQL. Every PR, every new feature, every refactor must align with these principles.
 
 ---
 
 ## Core Philosophy: Zero Unnecessary Allocation
 
-VictoriaMetrics achieves 10x less memory than competitors not through any single trick but by **systematically eliminating every source of unnecessary heap allocation** across the entire codebase. pgRx adopts this as its foundational engineering discipline.
+VictoriaMetrics achieves 10x less memory than competitors not through any single trick but by **systematically eliminating every source of unnecessary heap allocation** across the entire codebase. EvolvSQL adopts this as its foundational engineering discipline.
 
 The rules:
 
@@ -165,7 +165,7 @@ let mmap = MmapMut::map_anon(page_size * num_pages)?;
 
 **Benefits:**
 - OS page cache handles eviction automatically (no custom LRU needed initially)
-- No double-buffering (the exact problem pgRx solves vs PostgreSQL)
+- No double-buffering (the exact problem EvolvSQL solves vs PostgreSQL)
 - Pages stay warm in kernel cache even if Rust drops references
 - Transparent huge pages can be enabled for large pools
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 export PATH="$HOME/.local/share/mise/installs/erlang/27.2/bin:$HOME/.local/share/mise/installs/elixir/1.18.2-otp-27/bin:$PATH"
-CLI="/home/jagrit/pgrx/native/cli/target/release/pgrx"
-cd /home/jagrit/pgrx
+CLI="/home/jagrit/evolvsql/native/cli/target/release/evolvsql"
+cd /home/jagrit/evolvsql
 
 pkill -9 -f beam.smp 2>/dev/null; sleep 1
 mix run --no-halt &

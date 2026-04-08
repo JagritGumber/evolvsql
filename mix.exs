@@ -1,4 +1,4 @@
-defmodule Pgrx.MixProject do
+defmodule Evolvsql.MixProject do
   use Mix.Project
 
   def project do
@@ -14,7 +14,7 @@ defmodule Pgrx.MixProject do
 
   defp releases do
     [
-      pgrx: [
+      evolvsql: [
         applications: [
           wire: :permanent,
           engine: :permanent,

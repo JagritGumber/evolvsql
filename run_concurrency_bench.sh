@@ -1,8 +1,8 @@
 #!/bin/bash
 export PATH="$HOME/.local/share/mise/installs/erlang/27.2/bin:$HOME/.local/share/mise/installs/elixir/1.18.2-otp-27/bin:$PATH"
 export PGPASSWORD=postgres
-CLI="/home/jagrit/pgrx/native/cli/target/release/pgrx"
-cd /home/jagrit/pgrx
+CLI="/home/jagrit/evolvsql/native/cli/target/release/evolvsql"
+cd /home/jagrit/evolvsql
 
 # Force NIF recompile
 mix compile --force 2>&1 | tail -3
