@@ -1,23 +1,23 @@
 #!/bin/bash
 export PATH="$HOME/.local/share/mise/installs/erlang/27.2/bin:$HOME/.local/share/mise/installs/elixir/1.18.2-otp-27/bin:$PATH"
 export PGPASSWORD=postgres
-CLI="/home/jagrit/pgrx/native/cli/target/release/pgrx"
-cd /home/jagrit/pgrx
+CLI="/home/jagrit/evolvsql/native/cli/target/release/evolvsql"
+cd /home/jagrit/evolvsql
 
 pkill -9 -f beam.smp 2>/dev/null; sleep 1
 mix run --no-halt &
 sleep 6
 
 echo "============================================"
-echo "  Vector Search Benchmark: pgrx vs pgvector"
+echo "  Vector Search Benchmark: evolvsql vs pgvector"
 echo "============================================"
 echo ""
 
-# Setup pgrx
+# Setup evolvsql
 $CLI -c "CREATE TABLE vec_bench (id int PRIMARY KEY, embedding vector);" 2>/dev/null
 
 # Insert 1000 vectors (128-dim, random-ish)
-echo "Inserting 1000 × 128-dim vectors into pgrx..."
+echo "Inserting 1000 × 128-dim vectors into evolvsql..."
 for i in $(seq 1 10); do
   VALS=""
   for j in $(seq 1 100); do
@@ -47,11 +47,11 @@ for d in $(seq 1 128); do
 done
 QVEC="${QVEC}]"
 
-echo "=== pgrx: KNN search (1 client, 128-dim, 1000 vectors) ==="
+echo "=== evolvsql: KNN search (1 client, 128-dim, 1000 vectors) ==="
 $CLI --bench 100 --clients 1 -c "SELECT id FROM vec_bench ORDER BY embedding <-> '${QVEC}' LIMIT 10;" 2>&1 | grep -E "Throughput|Avg|P99"
 
 echo ""
-echo "=== pgrx: KNN search (10 clients) ==="
+echo "=== evolvsql: KNN search (10 clients) ==="
 $CLI --bench 100 --clients 10 -c "SELECT id FROM vec_bench ORDER BY embedding <-> '${QVEC}' LIMIT 10;" 2>&1 | grep -E "Throughput|Avg|P99"
 
 echo ""

@@ -1,8 +1,8 @@
-# pgrx — Project-Level Instructions
+# EvolvSQL - Project-Level Instructions
 
 ## Architecture
 
-pgrx is a PostgreSQL-compatible database engine built on BEAM (Elixir) + Rust.
+EvolvSQL is a PostgreSQL-compatible database engine built on BEAM (Elixir) + Rust.
 - **BEAM**: TCP connections, wire protocol, session state, hibernate, fault tolerance
 - **Rust NIF**: SQL parsing (pg_query), query execution, storage, vector operations
 - **Wire protocol**: PostgreSQL v3 (simple + extended query protocol)

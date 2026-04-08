@@ -24,7 +24,7 @@ defmodule Wire.Listener do
 
     case :gen_tcp.listen(port, tcp_opts) do
       {:ok, socket} ->
-        Logger.info("pgrx listening on port #{port}")
+        Logger.info("evolvsql listening on port #{port}")
         send(self(), :accept)
         {:ok, %{socket: socket}}
 

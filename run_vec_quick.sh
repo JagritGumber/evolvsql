@@ -1,8 +1,8 @@
 #!/bin/bash
 export PATH="$HOME/.local/share/mise/installs/erlang/27.2/bin:$HOME/.local/share/mise/installs/elixir/1.18.2-otp-27/bin:$PATH"
 export PGPASSWORD=postgres
-CLI="/home/jagrit/pgrx/native/cli/target/release/pgrx"
-cd /home/jagrit/pgrx
+CLI="/home/jagrit/evolvsql/native/cli/target/release/evolvsql"
+cd /home/jagrit/evolvsql
 
 pkill -9 -f beam.smp 2>/dev/null; sleep 1
 mix run --no-halt &
@@ -26,12 +26,12 @@ for batch in range(10):
     $CLI -c "$sql" 2>/dev/null
 done
 
-echo "=== pgrx: KNN 128-dim, 1000 vectors, 1 client ==="
+echo "=== evolvsql: KNN 128-dim, 1000 vectors, 1 client ==="
 QVEC=$(python3 -c "import random; random.seed(99); print('[' + ','.join([f'{random.random():.4f}' for _ in range(128)]) + ']')")
 $CLI --bench 100 --clients 1 -c "SELECT id FROM vb ORDER BY embedding <-> '${QVEC}' LIMIT 10;" 2>&1 | grep -E "Throughput|Avg|P99"
 
 echo ""
-echo "=== pgrx: KNN 128-dim, 1000 vectors, 10 clients ==="
+echo "=== evolvsql: KNN 128-dim, 1000 vectors, 10 clients ==="
 $CLI --bench 100 --clients 10 -c "SELECT id FROM vb ORDER BY embedding <-> '${QVEC}' LIMIT 10;" 2>&1 | grep -E "Throughput|Avg|P99"
 
 echo ""

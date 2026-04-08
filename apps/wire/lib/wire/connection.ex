@@ -517,11 +517,11 @@ defmodule Wire.Connection do
 
     cond do
       normalized == "select version()" ->
-        v = "pgrx 0.1.0 on BEAM/OTP 27 + Rust — PostgreSQL 18.0 compatible"
+        v = "evolvsql 0.1.0 on BEAM/OTP 27 + Rust - PostgreSQL 18.0 compatible"
         {:rows, [{"version", 25}], [[v]], "SELECT 1"}
 
       normalized == "select current_database()" ->
-        {:rows, [{"current_database", 25}], [["pgrx"]], "SELECT 1"}
+        {:rows, [{"current_database", 25}], [["evolvsql"]], "SELECT 1"}
 
       normalized == "" ->
         {:command, "EMPTY"}

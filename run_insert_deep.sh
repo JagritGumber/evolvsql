@@ -1,8 +1,8 @@
 #!/bin/bash
 export PATH="$HOME/.local/share/mise/installs/erlang/27.2/bin:$HOME/.local/share/mise/installs/elixir/1.18.2-otp-27/bin:$PATH"
 export PGPASSWORD=postgres
-CLI="/home/jagrit/pgrx/native/cli/target/release/pgrx"
-cd /home/jagrit/pgrx
+CLI="/home/jagrit/evolvsql/native/cli/target/release/evolvsql"
+cd /home/jagrit/evolvsql
 
 pkill -9 -f beam.smp 2>/dev/null; sleep 1
 mix run --no-halt &
@@ -18,7 +18,7 @@ echo ""
 
 $CLI -c "CREATE TABLE scale_test (id int PRIMARY KEY, name text);" 2>/dev/null
 
-echo "=== pgrx: INSERT 100 rows at various table sizes ==="
+echo "=== evolvsql: INSERT 100 rows at various table sizes ==="
 for SIZE in 0 1000 2000 5000 10000; do
   # Fill up to SIZE if needed
   CURRENT=$($CLI -c "SELECT COUNT(*) FROM scale_test;" 2>/dev/null | grep -oP '^\s*\d+' | tr -d ' ' || echo "0")
@@ -52,7 +52,7 @@ done
 $CLI -c "DROP TABLE scale_test;" 2>/dev/null
 
 echo ""
-echo "=== pgrx: INSERT without PK (no constraint check) ==="
+echo "=== evolvsql: INSERT without PK (no constraint check) ==="
 $CLI -c "CREATE TABLE no_pk (id int, name text);" 2>/dev/null
 
 for SIZE in 0 1000 5000 10000; do

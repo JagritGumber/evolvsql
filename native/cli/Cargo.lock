@@ -336,7 +336,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgrx-cli"
+name = "evolvsql-cli"
 version = "0.1.0"
 dependencies = [
  "base64",

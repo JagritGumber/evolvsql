@@ -1,6 +1,6 @@
-# Contributing to pgrx
+# Contributing to EvolvSQL
 
-Thanks for your interest in pgrx! We're building a PostgreSQL-compatible database from the ground up using BEAM (Erlang/Elixir) and Rust.
+Thanks for your interest in EvolvSQL! We're building a PostgreSQL-compatible database from the ground up using BEAM (Erlang/Elixir) and Rust.
 
 ## Current Status
 
@@ -27,4 +27,4 @@ Watch this repo or check back — we'll update this file when we're ready.
 
 ## License
 
-By contributing to pgrx, you agree that your contributions are licensed under the project's [BSL 1.1 License](LICENSE), which converts to AGPL-3.0 on 2030-03-21.
+By contributing to EvolvSQL, you agree that your contributions are licensed under the project's [BSL 1.1 License](LICENSE), which converts to AGPL-3.0 on 2030-03-21.

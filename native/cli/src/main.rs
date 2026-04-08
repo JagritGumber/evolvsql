@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "pgrx", about = "pgrx CLI — fast PostgreSQL-compatible client")]
+#[command(name = "evolvsql", about = "EvolvSQL CLI - fast PostgreSQL-compatible client")]
 struct Args {
     /// Host to connect to
     #[arg(short = 'h', long, default_value = "127.0.0.1")]
@@ -21,7 +21,7 @@ struct Args {
     user: String,
 
     /// Database name
-    #[arg(short, long, default_value = "pgrx")]
+    #[arg(short, long, default_value = "evolvsql")]
     dbname: String,
 
     /// Password
@@ -93,7 +93,7 @@ fn main() {
 
     // Interactive REPL
     println!(
-        "pgrx cli 0.1.0 — connected to {}:{}/{}",
+        "evolvsql cli 0.1.0 - connected to {}:{}/{}",
         args.host, args.port, args.dbname
     );
     println!("Type \\q to quit, \\timing to toggle timing.\n");

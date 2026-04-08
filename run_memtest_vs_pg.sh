@@ -4,11 +4,11 @@ export PGPASSWORD=postgres
 PG_HOST=127.0.0.1
 PG_PORT=5432
 PG_USER=postgres
-PGRX_PORT=5433
+EVOLVSQL_PORT=5433
 N=50
 
 echo "============================================"
-echo "  Memory Benchmark: pgrx vs PostgreSQL 17"
+echo "  Memory Benchmark: evolvsql vs PostgreSQL 17"
 echo "  $N connections"
 echo "============================================"
 echo ""
@@ -81,19 +81,19 @@ PG_BACKENDS2=$(count_pg_backends)
 echo "CLOSED:      ${PG_RSS2} KB total RSS (${PG_BACKENDS2} backends)"
 echo ""
 
-# ── pgrx Test ────────────────────────────────────────────
-echo "=== pgrx (BEAM + Rust) ==="
+# ── evolvsql Test ────────────────────────────────────────────
+echo "=== evolvsql (BEAM + Rust) ==="
 
-# Start pgrx
-cd /home/jagrit/pgrx
+# Start evolvsql
+cd /home/jagrit/evolvsql
 pkill -9 -f beam.smp 2>/dev/null
 sleep 1
 mix run --no-halt &
 SERVER_PID=$!
 sleep 6
 
-cd /home/jagrit/pgrx/native/cli
-./target/release/pgrx --memtest $N 2>&1 | grep -v "^\[info\]\|^\[notice\]"
+cd /home/jagrit/evolvsql/native/cli
+./target/release/evolvsql --memtest $N 2>&1 | grep -v "^\[info\]\|^\[notice\]"
 
 kill $SERVER_PID 2>/dev/null
 wait $SERVER_PID 2>/dev/null
@@ -101,6 +101,6 @@ wait $SERVER_PID 2>/dev/null
 echo ""
 echo "============================================"
 echo "  PostgreSQL: +${PG_DELTA} KB for $N connections"
-echo "  pgrx idle:  ~0 KB for $N hibernated connections"
+echo "  evolvsql idle:  ~0 KB for $N hibernated connections"
 echo "  Ratio:      PostgreSQL uses ~${PG_DELTA}x more memory"
 echo "============================================"

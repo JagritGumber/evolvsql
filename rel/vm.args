@@ -1,4 +1,4 @@
-## Minimal memory footprint for pgrx
+## Minimal memory footprint for evolvsql
 
 ## 2 normal schedulers, 8 dirty CPU, 1 dirty IO
 +S 2:2
