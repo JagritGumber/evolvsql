@@ -1089,7 +1089,7 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
 }
 
 #[inline(always)]
-fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut QueryArena) -> Result<ArenaValue, String> {
+pub(crate) fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut QueryArena) -> Result<ArenaValue, String> {
     match node {
         NodeEnum::ColumnRef(cref) => {
             let idx = resolve_column(cref, ctx)?;
@@ -3407,7 +3407,7 @@ fn exec_select_raw_post_filter(
     let window_offset = if rows.is_empty() { 0 } else { rows[0].len() };
     if !window_targets.is_empty() {
         let window_results =
-            crate::window::evaluate_window_functions(&window_targets, &rows, arena)?;
+            crate::window::evaluate_window_functions(&window_targets, &rows, &merged_ctx, arena)?;
         for (i, row) in rows.iter_mut().enumerate() {
             row.extend_from_slice(&window_results[i]);
         }
@@ -3425,7 +3425,12 @@ fn exec_select_raw_post_filter(
             SelectTarget::Expr { name, expr } => {
                 if let NodeEnum::FuncCall(fc) = expr {
                     if fc.over.is_some() {
-                        return Ok((name.clone(), TypeOid::Int8.oid()));
+                        let fname = extract_func_name(fc);
+                        let oid = match fname.as_str() {
+                            "row_number" | "rank" | "dense_rank" | "ntile" => TypeOid::Int8.oid(),
+                            _ => TypeOid::Text.oid(),
+                        };
+                        return Ok((name.clone(), oid));
                     }
                 }
                 Ok((name.clone(), TypeOid::Text.oid()))
@@ -6705,6 +6710,152 @@ mod tests {
             "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM wempty",
         ).unwrap();
         assert_eq!(r.rows.len(), 0);
+    }
+
+    // ---- Window value function tests ----
+
+    #[test]
+    #[serial_test::serial]
+    fn window_lag_basic() {
+        setup();
+        execute("CREATE TABLE wlag (id int, val int)").unwrap();
+        execute("INSERT INTO wlag VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wlag VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wlag VALUES (3, 30)").unwrap();
+        let r = execute(
+            "SELECT id, val, LAG(val) OVER (ORDER BY id) AS prev_val FROM wlag ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][2], None); // first row has no previous
+        assert_eq!(r.rows[1][2], Some("10".into()));
+        assert_eq!(r.rows[2][2], Some("20".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_lag_with_offset() {
+        setup();
+        execute("CREATE TABLE wlag2 (id int, val int)").unwrap();
+        execute("INSERT INTO wlag2 VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wlag2 VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wlag2 VALUES (3, 30)").unwrap();
+        execute("INSERT INTO wlag2 VALUES (4, 40)").unwrap();
+        let r = execute(
+            "SELECT id, LAG(val, 2) OVER (ORDER BY id) AS prev2 FROM wlag2 ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 4);
+        assert_eq!(r.rows[0][1], None);
+        assert_eq!(r.rows[1][1], None);
+        assert_eq!(r.rows[2][1], Some("10".into()));
+        assert_eq!(r.rows[3][1], Some("20".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_lag_with_default() {
+        setup();
+        execute("CREATE TABLE wlagd (id int, val int)").unwrap();
+        execute("INSERT INTO wlagd VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wlagd VALUES (2, 20)").unwrap();
+        let r = execute(
+            "SELECT id, LAG(val, 1, 0) OVER (ORDER BY id) AS prev_val FROM wlagd ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][1], Some("0".into())); // default value
+        assert_eq!(r.rows[1][1], Some("10".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_lead_basic() {
+        setup();
+        execute("CREATE TABLE wlead (id int, val int)").unwrap();
+        execute("INSERT INTO wlead VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wlead VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wlead VALUES (3, 30)").unwrap();
+        let r = execute(
+            "SELECT id, val, LEAD(val) OVER (ORDER BY id) AS next_val FROM wlead ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][2], Some("20".into()));
+        assert_eq!(r.rows[1][2], Some("30".into()));
+        assert_eq!(r.rows[2][2], None); // last row has no next
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_first_value() {
+        setup();
+        execute("CREATE TABLE wfirst (id int, dept text, salary int)").unwrap();
+        execute("INSERT INTO wfirst VALUES (1, 'eng', 100)").unwrap();
+        execute("INSERT INTO wfirst VALUES (2, 'eng', 200)").unwrap();
+        execute("INSERT INTO wfirst VALUES (3, 'sales', 300)").unwrap();
+        let r = execute(
+            "SELECT id, FIRST_VALUE(salary) OVER (PARTITION BY dept ORDER BY id) AS fv \
+             FROM wfirst ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][1], Some("100".into())); // eng first
+        assert_eq!(r.rows[1][1], Some("100".into())); // eng first
+        assert_eq!(r.rows[2][1], Some("300".into())); // sales first
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_last_value() {
+        setup();
+        execute("CREATE TABLE wlast (id int, val int)").unwrap();
+        execute("INSERT INTO wlast VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wlast VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wlast VALUES (3, 30)").unwrap();
+        // Default frame: UNBOUNDED PRECEDING to CURRENT ROW
+        // So LAST_VALUE returns the current row's value
+        let r = execute(
+            "SELECT id, LAST_VALUE(val) OVER (ORDER BY id) AS lv FROM wlast ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][1], Some("10".into()));
+        assert_eq!(r.rows[1][1], Some("20".into()));
+        assert_eq!(r.rows[2][1], Some("30".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_nth_value() {
+        setup();
+        execute("CREATE TABLE wnth (id int, val int)").unwrap();
+        execute("INSERT INTO wnth VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wnth VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wnth VALUES (3, 30)").unwrap();
+        let r = execute(
+            "SELECT id, NTH_VALUE(val, 2) OVER (ORDER BY id) AS nv FROM wnth ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        // Frame: UNBOUNDED PRECEDING to CURRENT ROW
+        // Row 1: frame [1], 2nd value doesn't exist -> NULL
+        // Row 2: frame [1,2], 2nd value = 20
+        // Row 3: frame [1,2,3], 2nd value = 20
+        assert_eq!(r.rows[0][1], None);
+        assert_eq!(r.rows[1][1], Some("20".into()));
+        assert_eq!(r.rows[2][1], Some("20".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_lag_with_partition() {
+        setup();
+        execute("CREATE TABLE wlagp (id int, dept text, salary int)").unwrap();
+        execute("INSERT INTO wlagp VALUES (1, 'eng', 100)").unwrap();
+        execute("INSERT INTO wlagp VALUES (2, 'eng', 200)").unwrap();
+        execute("INSERT INTO wlagp VALUES (3, 'sales', 300)").unwrap();
+        let r = execute(
+            "SELECT id, dept, LAG(salary) OVER (PARTITION BY dept ORDER BY id) AS prev \
+             FROM wlagp ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][2], None); // first in eng partition
+        assert_eq!(r.rows[1][2], Some("100".into())); // prev in eng
+        assert_eq!(r.rows[2][2], None); // first in sales partition
     }
 
 }
