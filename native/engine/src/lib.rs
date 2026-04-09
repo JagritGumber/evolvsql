@@ -6,6 +6,7 @@ mod parser;
 mod sequence;
 mod storage;
 mod types;
+mod window;
 
 use rustler::{Encoder, Env, Term};
 

@@ -36,19 +36,19 @@ pub struct QueryResult {
 // ── JoinContext: multi-table column resolution ───────────────────────
 
 /// A table source in a multi-table join context.
-struct JoinSource {
-    alias: String,
-    table_name: String,
+pub(crate) struct JoinSource {
+    pub(crate) alias: String,
+    pub(crate) table_name: String,
     #[allow(dead_code)] // needed for future cross-schema joins
-    schema: String,
-    table_def: Table,
-    col_offset: usize,
+    pub(crate) schema: String,
+    pub(crate) table_def: Table,
+    pub(crate) col_offset: usize,
 }
 
 /// Context for column resolution across potentially multiple tables.
-struct JoinContext {
-    sources: Vec<JoinSource>,
-    total_columns: usize,
+pub(crate) struct JoinContext {
+    pub(crate) sources: Vec<JoinSource>,
+    pub(crate) total_columns: usize,
 }
 
 impl JoinContext {
@@ -84,7 +84,7 @@ fn extract_string_fields(cref: &pg_query::protobuf::ColumnRef) -> Vec<String> {
 }
 
 /// Resolve a column reference to an index into the joined row.
-fn resolve_column(
+pub(crate) fn resolve_column(
     cref: &pg_query::protobuf::ColumnRef,
     ctx: &JoinContext,
 ) -> Result<usize, String> {
@@ -2501,7 +2501,7 @@ fn extract_const_vector(node: &NodeEnum) -> Option<Vec<f32>> {
     }
 }
 
-fn extract_func_name(fc: &pg_query::protobuf::FuncCall) -> String {
+pub(crate) fn extract_func_name(fc: &pg_query::protobuf::FuncCall) -> String {
     fc.funcname
         .iter()
         .filter_map(|n| n.node.as_ref())
@@ -2539,7 +2539,7 @@ fn query_has_aggregates(select: &pg_query::protobuf::SelectStmt) -> bool {
     select.target_list.iter().any(|t| {
         if let Some(NodeEnum::ResTarget(rt)) = t.node.as_ref() {
             if let Some(NodeEnum::FuncCall(fc)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-                return is_aggregate(&extract_func_name(fc));
+                return is_aggregate(&extract_func_name(fc)) && fc.over.is_none();
             }
         }
         false
@@ -3402,7 +3402,18 @@ fn exec_select_raw_post_filter(
         }
     }
 
-    // Project before DISTINCT/OFFSET/LIMIT (SQL order: PROJECT → DISTINCT → ORDER BY → OFFSET → LIMIT)
+    // Window function evaluation (after WHERE + ORDER BY, before projection)
+    let window_targets = crate::window::extract_window_targets(select, &merged_ctx, arena)?;
+    let window_offset = if rows.is_empty() { 0 } else { rows[0].len() };
+    if !window_targets.is_empty() {
+        let window_results =
+            crate::window::evaluate_window_functions(&window_targets, &rows, arena)?;
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.extend_from_slice(&window_results[i]);
+        }
+    }
+
+    // Project before DISTINCT/OFFSET/LIMIT (SQL order: PROJECT -> DISTINCT -> ORDER BY -> OFFSET -> LIMIT)
     // ORDER BY already applied above on full rows; now project to output columns
     let targets = resolve_targets(select, &merged_ctx)?;
     let columns: Vec<(String, i32)> = targets
@@ -3411,27 +3422,56 @@ fn exec_select_raw_post_filter(
             SelectTarget::Column { name, idx } => {
                 Ok((name.clone(), column_type_oid(*idx, &merged_ctx)?))
             }
-            SelectTarget::Expr { name, .. } => Ok((name.clone(), TypeOid::Text.oid())),
+            SelectTarget::Expr { name, expr } => {
+                if let NodeEnum::FuncCall(fc) = expr {
+                    if fc.over.is_some() {
+                        return Ok((name.clone(), TypeOid::Int8.oid()));
+                    }
+                }
+                Ok((name.clone(), TypeOid::Text.oid()))
+            }
         })
         .collect::<Result<Vec<_>, String>>()?;
 
     let mut result_rows = Vec::new();
-    for row in &rows {
-        let mut result_row = Vec::new();
-        for t in &targets {
-            let val = match t {
-                SelectTarget::Column { idx, .. } => {
-                    if *idx < row.len() {
-                        row[*idx]
-                    } else {
-                        return Err(format!(
-                            "internal error: column index {} out of range for row of width {}",
-                            idx, row.len()
-                        ));
+    let mut win_idx_base = 0;
+    // Pre-count window function positions in target list for projection
+    let window_positions: Vec<Option<usize>> = targets
+        .iter()
+        .map(|t| {
+            if let SelectTarget::Expr { expr, .. } = t {
+                if let NodeEnum::FuncCall(fc) = expr {
+                    if fc.over.is_some() {
+                        let idx = win_idx_base;
+                        win_idx_base += 1;
+                        return Some(idx);
                     }
                 }
-                SelectTarget::Expr { expr, .. } => {
-                    eval_expr(expr, row, &merged_ctx, arena)?
+            }
+            None
+        })
+        .collect();
+
+    for row in &rows {
+        let mut result_row = Vec::new();
+        for (ti, t) in targets.iter().enumerate() {
+            let val = if let Some(wi) = window_positions[ti] {
+                row[window_offset + wi]
+            } else {
+                match t {
+                    SelectTarget::Column { idx, .. } => {
+                        if *idx < row.len() {
+                            row[*idx]
+                        } else {
+                            return Err(format!(
+                                "internal error: column index {} out of range for row of width {}",
+                                idx, row.len()
+                            ));
+                        }
+                    }
+                    SelectTarget::Expr { expr, .. } => {
+                        eval_expr(expr, row, &merged_ctx, arena)?
+                    }
                 }
             };
             result_row.push(val);
@@ -3541,10 +3581,10 @@ fn exec_select(
 
 // ── ORDER BY helpers ──────────────────────────────────────────────────
 
-struct SortKey {
-    col_idx: usize,
-    ascending: bool,
-    nulls_first: bool,
+pub(crate) struct SortKey {
+    pub(crate) col_idx: usize,
+    pub(crate) ascending: bool,
+    pub(crate) nulls_first: bool,
 }
 
 /// Extended ORDER BY resolver that supports arbitrary expressions (e.g. `embedding <-> '[1,0,0]'`).
@@ -3646,7 +3686,7 @@ fn resolve_ordinal_to_col_idx(
     Err("ORDER BY ordinal must reference a column".into())
 }
 
-fn compare_rows(keys: &[SortKey], a: &[ArenaValue], b: &[ArenaValue], arena: &QueryArena) -> std::cmp::Ordering {
+pub(crate) fn compare_rows(keys: &[SortKey], a: &[ArenaValue], b: &[ArenaValue], arena: &QueryArena) -> std::cmp::Ordering {
     for k in keys {
         let va = a.get(k.col_idx).copied().unwrap_or(ArenaValue::Null);
         let vb = b.get(k.col_idx).copied().unwrap_or(ArenaValue::Null);
@@ -3676,7 +3716,7 @@ fn compare_rows(keys: &[SortKey], a: &[ArenaValue], b: &[ArenaValue], arena: &Qu
     std::cmp::Ordering::Equal
 }
 
-fn eval_const_i64(node: Option<&NodeEnum>) -> Option<i64> {
+pub(crate) fn eval_const_i64(node: Option<&NodeEnum>) -> Option<i64> {
     match eval_const(node) {
         Value::Int(n) => Some(n),
         Value::Float(f) => Some(f as i64),
@@ -6497,6 +6537,174 @@ mod tests {
         let r = execute("SELECT first_name AS name FROM ca").unwrap();
         assert_eq!(r.columns[0].0, "name");
         assert_eq!(r.rows[0][0], Some("alice".into()));
+    }
+
+    // ---- Window function tests ----
+
+    #[test]
+    #[serial_test::serial]
+    fn window_row_number_partition() {
+        setup();
+        execute("CREATE TABLE wemp (id int, dept text, salary int)").unwrap();
+        execute("INSERT INTO wemp VALUES (1, 'eng', 100)").unwrap();
+        execute("INSERT INTO wemp VALUES (2, 'eng', 200)").unwrap();
+        execute("INSERT INTO wemp VALUES (3, 'sales', 150)").unwrap();
+        execute("INSERT INTO wemp VALUES (4, 'sales', 250)").unwrap();
+        let r = execute(
+            "SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) AS rn FROM wemp",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 4);
+        assert_eq!(r.columns[2].0, "rn");
+        // eng partition: id=1 salary=100 -> rn=1, id=2 salary=200 -> rn=2
+        // sales partition: id=3 salary=150 -> rn=1, id=4 salary=250 -> rn=2
+        // Rows are in original order, so check by id
+        for row in &r.rows {
+            let id: i64 = row[0].as_ref().unwrap().parse().unwrap();
+            let rn = row[2].as_ref().unwrap();
+            match id {
+                1 => assert_eq!(rn, "1"),
+                2 => assert_eq!(rn, "2"),
+                3 => assert_eq!(rn, "1"),
+                4 => assert_eq!(rn, "2"),
+                _ => panic!("unexpected id"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_row_number_no_partition() {
+        setup();
+        execute("CREATE TABLE wnp (id int, val int)").unwrap();
+        execute("INSERT INTO wnp VALUES (3, 30)").unwrap();
+        execute("INSERT INTO wnp VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wnp VALUES (2, 20)").unwrap();
+        let r = execute(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM wnp ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        // All rows in one partition, ordered by id
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
+        assert_eq!(r.rows[1][1], Some("2".into()));
+        assert_eq!(r.rows[2][0], Some("3".into()));
+        assert_eq!(r.rows[2][1], Some("3".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_rank_with_ties() {
+        setup();
+        execute("CREATE TABLE wrank (player text, score int)").unwrap();
+        execute("INSERT INTO wrank VALUES ('alice', 100)").unwrap();
+        execute("INSERT INTO wrank VALUES ('bob', 100)").unwrap();
+        execute("INSERT INTO wrank VALUES ('carol', 90)").unwrap();
+        let r = execute(
+            "SELECT player, RANK() OVER (ORDER BY score DESC) AS rnk FROM wrank",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        // alice and bob tie at score 100 -> rank 1, carol at 90 -> rank 3
+        for row in &r.rows {
+            let player = row[0].as_ref().unwrap().as_str();
+            let rnk = row[1].as_ref().unwrap();
+            match player {
+                "alice" | "bob" => assert_eq!(rnk, "1"),
+                "carol" => assert_eq!(rnk, "3"),
+                _ => panic!("unexpected player"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_dense_rank() {
+        setup();
+        execute("CREATE TABLE wdense (player text, score int)").unwrap();
+        execute("INSERT INTO wdense VALUES ('alice', 100)").unwrap();
+        execute("INSERT INTO wdense VALUES ('bob', 100)").unwrap();
+        execute("INSERT INTO wdense VALUES ('carol', 90)").unwrap();
+        let r = execute(
+            "SELECT player, DENSE_RANK() OVER (ORDER BY score DESC) AS rnk FROM wdense",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        // alice and bob -> dense_rank 1, carol -> dense_rank 2 (no gap)
+        for row in &r.rows {
+            let player = row[0].as_ref().unwrap().as_str();
+            let rnk = row[1].as_ref().unwrap();
+            match player {
+                "alice" | "bob" => assert_eq!(rnk, "1"),
+                "carol" => assert_eq!(rnk, "2"),
+                _ => panic!("unexpected player"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_ntile() {
+        setup();
+        execute("CREATE TABLE wntile (id int)").unwrap();
+        execute("INSERT INTO wntile VALUES (1)").unwrap();
+        execute("INSERT INTO wntile VALUES (2)").unwrap();
+        execute("INSERT INTO wntile VALUES (3)").unwrap();
+        execute("INSERT INTO wntile VALUES (4)").unwrap();
+        execute("INSERT INTO wntile VALUES (5)").unwrap();
+        let r = execute(
+            "SELECT id, NTILE(3) OVER (ORDER BY id) AS bucket FROM wntile",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 5);
+        // 5 rows into 3 buckets: [1,2] [3,4] [5] -> buckets 1,1,2,2,3
+        assert_eq!(r.rows[0][1], Some("1".into()));
+        assert_eq!(r.rows[1][1], Some("1".into()));
+        assert_eq!(r.rows[2][1], Some("2".into()));
+        assert_eq!(r.rows[3][1], Some("2".into()));
+        assert_eq!(r.rows[4][1], Some("3".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_multiple_functions() {
+        setup();
+        execute("CREATE TABLE wmulti (id int, val int)").unwrap();
+        execute("INSERT INTO wmulti VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wmulti VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wmulti VALUES (3, 20)").unwrap();
+        let r = execute(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY val) AS rn, \
+             RANK() OVER (ORDER BY val) AS rnk FROM wmulti",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.columns[1].0, "rn");
+        assert_eq!(r.columns[2].0, "rnk");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_with_where() {
+        setup();
+        execute("CREATE TABLE wwhere (id int, dept text, salary int)").unwrap();
+        execute("INSERT INTO wwhere VALUES (1, 'eng', 100)").unwrap();
+        execute("INSERT INTO wwhere VALUES (2, 'eng', 200)").unwrap();
+        execute("INSERT INTO wwhere VALUES (3, 'sales', 150)").unwrap();
+        let r = execute(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY salary) AS rn FROM wwhere WHERE dept = 'eng'",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        // Only eng rows: salary 100 -> rn=1, salary 200 -> rn=2
+        assert_eq!(r.rows[0][1], Some("1".into()));
+        assert_eq!(r.rows[1][1], Some("2".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_empty_table() {
+        setup();
+        execute("CREATE TABLE wempty (id int)").unwrap();
+        let r = execute(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM wempty",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 0);
     }
 
 }
