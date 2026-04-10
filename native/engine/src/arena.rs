@@ -4,14 +4,25 @@
 //! ArenaValue is Copy (16 bytes) — no Arc, no Drop, no refcount.
 //! All memory freed at once when QueryArena drops.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+/// Materialized CTE result stored in the query arena.
+/// Uses Value (heap-allocated) instead of ArenaValue so CTE data is
+/// self-contained and independent of any arena's byte/float buffers.
+#[derive(Debug, Clone)]
+pub(crate) struct CteEntry {
+    pub columns: Vec<(String, i32)>,
+    pub rows: Vec<Vec<crate::types::Value>>,
+}
+
 /// Per-query byte arena. Strings and vectors are packed contiguously.
-/// Created at query start, dropped at query end — single deallocation.
+/// Created at query start, dropped at query end - single deallocation.
 #[derive(Debug)]
 pub struct QueryArena {
     bytes: Vec<u8>,
     floats: Vec<f32>,
+    pub(crate) cte_registry: HashMap<String, CteEntry>,
 }
 
 /// Reference to a string in the arena's byte buffer. 8 bytes, Copy.
@@ -47,6 +58,7 @@ impl QueryArena {
         Self {
             bytes: Vec::with_capacity(4096),
             floats: Vec::with_capacity(256),
+            cte_registry: HashMap::new(),
         }
     }
 
@@ -54,6 +66,7 @@ impl QueryArena {
         Self {
             bytes: Vec::with_capacity(bytes),
             floats: Vec::with_capacity(floats),
+            cte_registry: HashMap::new(),
         }
     }
 

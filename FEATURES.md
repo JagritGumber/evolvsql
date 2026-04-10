@@ -128,7 +128,7 @@ Each feature is categorized by priority tier and assigned to a layer (BEAM or Ru
 - [ ] UNION / INTERSECT / EXCEPT (and ALL variants)
 - [ ] GROUP BY / HAVING
 - [ ] DISTINCT / DISTINCT ON
-- [ ] Common Table Expressions — WITH (PG 8.4)
+- [x] Common Table Expressions — WITH (PG 8.4)
 - [ ] WITH RECURSIVE (PG 8.4)
 - [ ] Data-modifying CTEs (PG 9.1)
 - [ ] CTE inlining — MATERIALIZED / NOT MATERIALIZED (PG 12)
