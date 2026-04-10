@@ -5,7 +5,8 @@ use pg_query::NodeEnum;
 
 use crate::arena::{ArenaValue, QueryArena};
 use crate::executor::{
-    JoinContext, SortKey, compare_rows, eval_const_i64, extract_func_name, resolve_column,
+    JoinContext, SortKey, compare_rows, eval_const_i64, eval_expr, extract_func_name,
+    resolve_column,
 };
 
 pub(crate) struct WindowSpec {
@@ -18,6 +19,11 @@ pub(crate) enum WindowFuncKind {
     Rank,
     DenseRank,
     Ntile(i64),
+    Lag { expr: NodeEnum, offset: i64, default: Option<NodeEnum> },
+    Lead { expr: NodeEnum, offset: i64, default: Option<NodeEnum> },
+    FirstValue { expr: NodeEnum },
+    LastValue { expr: NodeEnum },
+    NthValue { expr: NodeEnum, n: i64 },
 }
 
 pub(crate) struct WindowTarget {
@@ -93,6 +99,52 @@ pub(crate) fn extract_window_targets(
                                 return Err("NTILE argument must be positive".into());
                             }
                             WindowFuncKind::Ntile(n)
+                        }
+                        "lag" | "lead" => {
+                            let expr_node = fc.args.first()
+                                .and_then(|a| a.node.as_ref())
+                                .ok_or("LAG/LEAD requires an expression argument")?
+                                .clone();
+                            let offset = fc.args.get(1)
+                                .and_then(|a| a.node.as_ref())
+                                .and_then(|n| eval_const_i64(Some(n)))
+                                .unwrap_or(1);
+                            let default = fc.args.get(2)
+                                .and_then(|a| a.node.as_ref())
+                                .cloned();
+                            if name == "lag" {
+                                WindowFuncKind::Lag { expr: expr_node, offset, default }
+                            } else {
+                                WindowFuncKind::Lead { expr: expr_node, offset, default }
+                            }
+                        }
+                        "first_value" => {
+                            let expr_node = fc.args.first()
+                                .and_then(|a| a.node.as_ref())
+                                .ok_or("FIRST_VALUE requires an expression argument")?
+                                .clone();
+                            WindowFuncKind::FirstValue { expr: expr_node }
+                        }
+                        "last_value" => {
+                            let expr_node = fc.args.first()
+                                .and_then(|a| a.node.as_ref())
+                                .ok_or("LAST_VALUE requires an expression argument")?
+                                .clone();
+                            WindowFuncKind::LastValue { expr: expr_node }
+                        }
+                        "nth_value" => {
+                            let expr_node = fc.args.first()
+                                .and_then(|a| a.node.as_ref())
+                                .ok_or("NTH_VALUE requires an expression argument")?
+                                .clone();
+                            let n = fc.args.get(1)
+                                .and_then(|a| a.node.as_ref())
+                                .and_then(|n| eval_const_i64(Some(n)))
+                                .ok_or("NTH_VALUE requires an integer second argument")?;
+                            if n <= 0 {
+                                return Err("NTH_VALUE argument must be positive".into());
+                            }
+                            WindowFuncKind::NthValue { expr: expr_node, n }
                         }
                         _ => {
                             let _ = arena;
@@ -174,7 +226,8 @@ fn sort_partition(
 pub(crate) fn evaluate_window_functions(
     targets: &[WindowTarget],
     rows: &[Vec<ArenaValue>],
-    arena: &QueryArena,
+    ctx: &JoinContext,
+    arena: &mut QueryArena,
 ) -> Result<Vec<Vec<ArenaValue>>, String> {
     let n = rows.len();
     let m = targets.len();
@@ -184,7 +237,17 @@ pub(crate) fn evaluate_window_functions(
         let mut partitions = partition_rows(rows, &wt.spec.partition_keys, arena);
         for partition in &mut partitions {
             sort_partition(partition, &wt.spec.sort_keys, rows, arena);
-            compute_ranking(&wt.kind, partition, &wt.spec.sort_keys, rows, arena, wf_idx, &mut results);
+            match &wt.kind {
+                WindowFuncKind::RowNumber
+                | WindowFuncKind::Rank
+                | WindowFuncKind::DenseRank
+                | WindowFuncKind::Ntile(_) => {
+                    compute_ranking(&wt.kind, partition, &wt.spec.sort_keys, rows, arena, wf_idx, &mut results);
+                }
+                _ => {
+                    compute_value(&wt.kind, partition, &wt.spec.sort_keys, rows, ctx, arena, wf_idx, &mut results)?;
+                }
+            }
         }
     }
 
@@ -241,7 +304,6 @@ fn compute_ranking(
             let base_size = plen / n;
             let extra = plen % n;
             let mut bucket = 1usize;
-            let mut count = 0usize;
             let bucket_size = if extra > 0 { base_size + 1 } else { base_size };
             let mut threshold = bucket_size;
             for (pos, &row_idx) in partition.iter().enumerate() {
@@ -251,9 +313,115 @@ fn compute_ranking(
                     threshold += bs;
                 }
                 results[row_idx][wf_idx] = ArenaValue::Int(bucket as i64);
-                count = pos + 1;
             }
-            let _ = count;
         }
+        _ => {}
     }
+}
+
+/// Find the last peer position for RANGE frame semantics.
+/// Peers are rows with equal ORDER BY values.
+fn last_peer_pos(
+    pos: usize,
+    partition: &[usize],
+    sort_keys: &[SortKey],
+    rows: &[Vec<ArenaValue>],
+    arena: &QueryArena,
+) -> usize {
+    if sort_keys.is_empty() {
+        return partition.len() - 1;
+    }
+    let mut end = pos;
+    while end + 1 < partition.len() {
+        if compare_rows(sort_keys, &rows[partition[pos]], &rows[partition[end + 1]], arena)
+            != std::cmp::Ordering::Equal
+        {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+/// Compute value function results (LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE)
+/// for one partition.
+fn compute_value(
+    kind: &WindowFuncKind,
+    partition: &[usize],
+    sort_keys: &[SortKey],
+    rows: &[Vec<ArenaValue>],
+    ctx: &JoinContext,
+    arena: &mut QueryArena,
+    wf_idx: usize,
+    results: &mut [Vec<ArenaValue>],
+) -> Result<(), String> {
+    match kind {
+        WindowFuncKind::Lag { expr, offset, default } => {
+            for (pos, &row_idx) in partition.iter().enumerate() {
+                let target_pos = pos as i64 - offset;
+                let val = if target_pos >= 0 && (target_pos as usize) < partition.len() {
+                    let target_row = partition[target_pos as usize];
+                    eval_expr(expr, &rows[target_row], ctx, arena)?
+                } else if let Some(def_expr) = default {
+                    eval_expr(def_expr, &rows[row_idx], ctx, arena)?
+                } else {
+                    ArenaValue::Null
+                };
+                results[row_idx][wf_idx] = val;
+            }
+        }
+        WindowFuncKind::Lead { expr, offset, default } => {
+            for (pos, &row_idx) in partition.iter().enumerate() {
+                let target_pos = pos as i64 + offset;
+                let val = if target_pos >= 0 && (target_pos as usize) < partition.len() {
+                    let target_row = partition[target_pos as usize];
+                    eval_expr(expr, &rows[target_row], ctx, arena)?
+                } else if let Some(def_expr) = default {
+                    eval_expr(def_expr, &rows[row_idx], ctx, arena)?
+                } else {
+                    ArenaValue::Null
+                };
+                results[row_idx][wf_idx] = val;
+            }
+        }
+        WindowFuncKind::FirstValue { expr } => {
+            if partition.is_empty() {
+                return Ok(());
+            }
+            // Default frame: UNBOUNDED PRECEDING to CURRENT ROW
+            // FIRST_VALUE always returns the first row in the frame
+            let first_row = partition[0];
+            let val = eval_expr(expr, &rows[first_row], ctx, arena)?;
+            for &row_idx in partition {
+                results[row_idx][wf_idx] = val;
+            }
+        }
+        WindowFuncKind::LastValue { expr } => {
+            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // In RANGE mode, CURRENT ROW means the last peer row
+            for (pos, &row_idx) in partition.iter().enumerate() {
+                let peer_end = last_peer_pos(pos, partition, sort_keys, rows, arena);
+                let target_row = partition[peer_end];
+                let val = eval_expr(expr, &rows[target_row], ctx, arena)?;
+                results[row_idx][wf_idx] = val;
+            }
+        }
+        WindowFuncKind::NthValue { expr, n } => {
+            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // In RANGE mode, frame end is the last peer row
+            let target_pos = (*n - 1) as usize; // 1-indexed to 0-indexed
+            for (pos, &row_idx) in partition.iter().enumerate() {
+                let peer_end = last_peer_pos(pos, partition, sort_keys, rows, arena);
+                let val = if target_pos <= peer_end {
+                    let target_row = partition[target_pos];
+                    eval_expr(expr, &rows[target_row], ctx, arena)?
+                } else {
+                    ArenaValue::Null
+                };
+                results[row_idx][wf_idx] = val;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
