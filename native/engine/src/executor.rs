@@ -3113,6 +3113,28 @@ fn exec_select_raw(
     outer: Option<(&[ArenaValue], &JoinContext)>,
     arena: &mut QueryArena,
 ) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
+    // Snapshot CTE registry so CTEs defined here don't leak to callers.
+    let cte_snapshot = if select.with_clause.is_some() {
+        Some(arena.cte_registry.clone())
+    } else {
+        None
+    };
+
+    let result = exec_select_raw_body(select, outer, arena);
+
+    // Restore CTE registry to prevent scope leakage
+    if let Some(snapshot) = cte_snapshot {
+        arena.cte_registry = snapshot;
+    }
+
+    result
+}
+
+fn exec_select_raw_body(
+    select: &pg_query::protobuf::SelectStmt,
+    outer: Option<(&[ArenaValue], &JoinContext)>,
+    arena: &mut QueryArena,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
     // Execute CTEs before anything else (must be visible to all downstream paths)
     if let Some(ref wc) = select.with_clause {
         if wc.recursive {
