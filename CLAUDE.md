@@ -108,6 +108,7 @@ Currently supported:
 - Expressions: arithmetic (+ - * / %), comparison, boolean logic, IS NULL, LIKE, ILIKE, CASE WHEN, COALESCE, NULLIF
 - Aggregates: COUNT, SUM, AVG, MIN, MAX, STRING_AGG, BOOL_AND, BOOL_OR (with DISTINCT support)
 - Window functions: ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, SUM/COUNT/AVG/MIN/MAX OVER
+- CTEs: WITH (non-recursive), column aliases, chained CTEs, CTE in subqueries
 - String functions: upper, lower, length, concat, substring, trim, replace, position, left, right
 - Math functions: abs, ceil, floor, round, mod, power, sqrt
 - Sequence functions: nextval, currval, setval

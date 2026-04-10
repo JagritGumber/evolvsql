@@ -2556,6 +2556,35 @@ fn execute_from(node: &NodeEnum, arena: &mut QueryArena) -> Result<(Vec<Vec<Aren
                 .as_ref()
                 .map(|a| a.aliasname.clone())
                 .unwrap_or_else(|| rv.relname.clone());
+
+            // Check CTE registry first (CTEs shadow real tables per SQL standard)
+            if let Some(cte) = arena.cte_registry.get(&rv.relname) {
+                let rows = cte.rows.clone();
+                let columns: Vec<Column> = cte.columns.iter()
+                    .map(|(name, oid)| Column {
+                        name: name.clone(),
+                        type_oid: TypeOid::from_oid(*oid),
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                        default_expr: None,
+                    })
+                    .collect();
+                let ncols = columns.len();
+                let table_def = Table { name: alias.clone(), schema: String::new(), columns };
+                let ctx = JoinContext {
+                    sources: vec![JoinSource {
+                        alias,
+                        table_name: rv.relname.clone(),
+                        schema: String::new(),
+                        table_def,
+                        col_offset: 0,
+                    }],
+                    total_columns: ncols,
+                };
+                return Ok((rows, ctx));
+            }
+
             let schema = if rv.schemaname.is_empty() {
                 "public"
             } else {
@@ -3078,6 +3107,42 @@ fn exec_select_raw(
     outer: Option<(&[ArenaValue], &JoinContext)>,
     arena: &mut QueryArena,
 ) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
+    // Execute CTEs before anything else (must be visible to all downstream paths)
+    if let Some(ref wc) = select.with_clause {
+        if wc.recursive {
+            return Err("WITH RECURSIVE is not yet supported".into());
+        }
+        for cte_node in &wc.ctes {
+            if let Some(NodeEnum::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let inner = cte.ctequery.as_ref()
+                    .and_then(|n| n.node.as_ref())
+                    .ok_or("CTE missing query")?;
+                let NodeEnum::SelectStmt(sel) = inner else {
+                    return Err("data-modifying CTEs are not yet supported".into());
+                };
+                let (mut cols, rows) = exec_select_raw(sel, None, arena)?;
+                // Apply column aliases if specified
+                if !cte.aliascolnames.is_empty() {
+                    if cte.aliascolnames.len() != cols.len() {
+                        return Err(format!(
+                            "WITH query \"{}\" has {} columns but {} aliases specified",
+                            cte.ctename, cols.len(), cte.aliascolnames.len()
+                        ));
+                    }
+                    for (i, alias_node) in cte.aliascolnames.iter().enumerate() {
+                        if let Some(NodeEnum::String(s)) = alias_node.node.as_ref() {
+                            cols[i].0 = s.sval.clone();
+                        }
+                    }
+                }
+                arena.cte_registry.insert(
+                    cte.ctename.clone(),
+                    crate::arena::CteEntry { columns: cols, rows },
+                );
+            }
+        }
+    }
+
     // Handle UNION / INTERSECT / EXCEPT (set operations)
     let set_op = select.op;
     if set_op == pg_query::protobuf::SetOperation::SetopUnion as i32
@@ -3161,10 +3226,14 @@ fn exec_select_raw(
         return exec_select_raw_no_from(select, outer, arena);
     }
 
-    // Fast path: single-table query with no outer context — use scan_with
+    // Fast path: single-table query with no outer context - use scan_with
     // to filter inside the lock and clone only matching rows.
+    // Skip fast path if the table name matches a CTE (CTEs have no storage backing).
     if select.from_clause.len() == 1 && outer.is_none() {
         if let Some(NodeEnum::RangeVar(rv)) = select.from_clause[0].node.as_ref() {
+            if arena.cte_registry.contains_key(&rv.relname) {
+                // Fall through to general path which handles CTE lookup in execute_from
+            } else {
             let schema = if rv.schemaname.is_empty() { "public" } else { &rv.schemaname };
             let table_def = catalog::get_table(schema, &rv.relname)
                 .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
@@ -3259,6 +3328,7 @@ fn exec_select_raw(
                 } else {
                     // Single arena shared across all rows (not per-row).
                     let mut scan_arena = QueryArena::new();
+                    scan_arena.cte_registry = arena.cte_registry.clone();
                     for row in all_rows {
                         if eval_where_value(&select.where_clause, row, &ctx, &mut scan_arena)? {
                             filtered.push(row.clone());
@@ -3271,6 +3341,7 @@ fn exec_select_raw(
 
             let result = exec_select_raw_post_filter(select, ctx, rows, 0, arena);
             return result;
+        } // end else (not a CTE)
         }
     }
 
@@ -7020,6 +7091,165 @@ mod tests {
         assert_eq!(r.rows[0][1], Some("1".into()));
         assert_eq!(r.rows[1][1], Some("1".into())); // NULL skipped
         assert_eq!(r.rows[2][1], Some("2".into()));
+    }
+
+    // ---- CTE tests ----
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_basic() {
+        setup();
+        let r = execute("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.columns[0].0, "x");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_from_table() {
+        setup();
+        execute("CREATE TABLE cte_t (id int, name text)").unwrap();
+        execute("INSERT INTO cte_t VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO cte_t VALUES (2, 'bob')").unwrap();
+        let r = execute(
+            "WITH active AS (SELECT * FROM cte_t WHERE id = 1) SELECT * FROM active",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_with_where() {
+        setup();
+        execute("CREATE TABLE cte_w (id int, val int)").unwrap();
+        execute("INSERT INTO cte_w VALUES (1, 10)").unwrap();
+        execute("INSERT INTO cte_w VALUES (2, 20)").unwrap();
+        execute("INSERT INTO cte_w VALUES (3, 30)").unwrap();
+        let r = execute(
+            "WITH data AS (SELECT * FROM cte_w) SELECT * FROM data WHERE val > 15 ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("2".into()));
+        assert_eq!(r.rows[1][0], Some("3".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_multiple() {
+        setup();
+        let r = execute(
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a, b",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("2".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_with_join() {
+        setup();
+        execute("CREATE TABLE cte_users (id int, name text)").unwrap();
+        execute("CREATE TABLE cte_orders (id int, user_id int, amount int)").unwrap();
+        execute("INSERT INTO cte_users VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO cte_orders VALUES (1, 1, 100)").unwrap();
+        let r = execute(
+            "WITH u AS (SELECT * FROM cte_users) \
+             SELECT u.name, o.amount FROM u JOIN cte_orders o ON u.id = o.user_id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+        assert_eq!(r.rows[0][1], Some("100".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_column_alias() {
+        setup();
+        execute("CREATE TABLE cte_ca (id int, name text)").unwrap();
+        execute("INSERT INTO cte_ca VALUES (1, 'alice')").unwrap();
+        let r = execute(
+            "WITH cte(x, y) AS (SELECT id, name FROM cte_ca) SELECT x, y FROM cte",
+        ).unwrap();
+        assert_eq!(r.columns[0].0, "x");
+        assert_eq!(r.columns[1].0, "y");
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_referenced_twice() {
+        setup();
+        let r = execute(
+            "WITH nums AS (SELECT 1 AS n UNION ALL SELECT 2) \
+             SELECT a.n, b.n FROM nums a, nums b ORDER BY a.n, b.n",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 4); // 2x2 cross join
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_chained() {
+        setup();
+        let r = execute(
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT x + 1 AS y FROM a) SELECT * FROM b",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("2".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_shadows_table() {
+        setup();
+        execute("CREATE TABLE shadow_t (id int)").unwrap();
+        execute("INSERT INTO shadow_t VALUES (999)").unwrap();
+        // CTE named "shadow_t" should shadow the real table
+        let r = execute(
+            "WITH shadow_t AS (SELECT 1 AS id) SELECT * FROM shadow_t",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_empty() {
+        setup();
+        execute("CREATE TABLE cte_e (id int)").unwrap();
+        let r = execute(
+            "WITH empty AS (SELECT * FROM cte_e) SELECT * FROM empty",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_in_subquery() {
+        setup();
+        execute("CREATE TABLE cte_sq (id int, val int)").unwrap();
+        execute("INSERT INTO cte_sq VALUES (1, 10)").unwrap();
+        execute("INSERT INTO cte_sq VALUES (2, 20)").unwrap();
+        let r = execute(
+            "WITH target_ids AS (SELECT 1 AS tid) \
+             SELECT * FROM cte_sq WHERE id IN (SELECT tid FROM target_ids)",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_recursive_error() {
+        setup();
+        let r = execute(
+            "WITH RECURSIVE cte AS (SELECT 1 UNION ALL SELECT 1) SELECT * FROM cte",
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("WITH RECURSIVE"));
     }
 
 }
