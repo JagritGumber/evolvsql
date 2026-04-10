@@ -3428,6 +3428,16 @@ fn exec_select_raw_post_filter(
                         let fname = extract_func_name(fc);
                         let oid = match fname.as_str() {
                             "row_number" | "rank" | "dense_rank" | "ntile" => TypeOid::Int8.oid(),
+                            "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
+                                fc.args.first()
+                                    .and_then(|a| a.node.as_ref())
+                                    .and_then(|node| match node {
+                                        NodeEnum::ColumnRef(cref) => resolve_column(cref, &merged_ctx).ok(),
+                                        _ => None,
+                                    })
+                                    .and_then(|idx| column_type_oid(idx, &merged_ctx).ok())
+                                    .unwrap_or(TypeOid::Text.oid())
+                            }
                             _ => TypeOid::Text.oid(),
                         };
                         return Ok((name.clone(), oid));
@@ -6808,8 +6818,8 @@ mod tests {
         execute("INSERT INTO wlast VALUES (1, 10)").unwrap();
         execute("INSERT INTO wlast VALUES (2, 20)").unwrap();
         execute("INSERT INTO wlast VALUES (3, 30)").unwrap();
-        // Default frame: UNBOUNDED PRECEDING to CURRENT ROW
-        // So LAST_VALUE returns the current row's value
+        // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        // No peers (unique ORDER BY values), so LAST_VALUE = current row
         let r = execute(
             "SELECT id, LAST_VALUE(val) OVER (ORDER BY id) AS lv FROM wlast ORDER BY id",
         ).unwrap();
@@ -6817,6 +6827,27 @@ mod tests {
         assert_eq!(r.rows[0][1], Some("10".into()));
         assert_eq!(r.rows[1][1], Some("20".into()));
         assert_eq!(r.rows[2][1], Some("30".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn window_last_value_peers() {
+        setup();
+        execute("CREATE TABLE wlastp (id int, val int)").unwrap();
+        execute("INSERT INTO wlastp VALUES (1, 10)").unwrap();
+        execute("INSERT INTO wlastp VALUES (2, 20)").unwrap();
+        execute("INSERT INTO wlastp VALUES (3, 20)").unwrap();
+        execute("INSERT INTO wlastp VALUES (4, 30)").unwrap();
+        // RANGE frame: peers with val=20 (id=2,3) share frame end
+        // LAST_VALUE for id=2 and id=3 should both be id=3's value (20)
+        let r = execute(
+            "SELECT id, LAST_VALUE(id) OVER (ORDER BY val) AS lv FROM wlastp ORDER BY id",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 4);
+        assert_eq!(r.rows[0][1], Some("1".into())); // val=10, no peers, last=self
+        assert_eq!(r.rows[1][1], Some("3".into())); // val=20, peer group [2,3], last=3
+        assert_eq!(r.rows[2][1], Some("3".into())); // val=20, peer group [2,3], last=3
+        assert_eq!(r.rows[3][1], Some("4".into())); // val=30, no peers, last=self
     }
 
     #[test]

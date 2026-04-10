@@ -245,7 +245,7 @@ pub(crate) fn evaluate_window_functions(
                     compute_ranking(&wt.kind, partition, &wt.spec.sort_keys, rows, arena, wf_idx, &mut results);
                 }
                 _ => {
-                    compute_value(&wt.kind, partition, rows, ctx, arena, wf_idx, &mut results)?;
+                    compute_value(&wt.kind, partition, &wt.spec.sort_keys, rows, ctx, arena, wf_idx, &mut results)?;
                 }
             }
         }
@@ -319,11 +319,36 @@ fn compute_ranking(
     }
 }
 
+/// Find the last peer position for RANGE frame semantics.
+/// Peers are rows with equal ORDER BY values.
+fn last_peer_pos(
+    pos: usize,
+    partition: &[usize],
+    sort_keys: &[SortKey],
+    rows: &[Vec<ArenaValue>],
+    arena: &QueryArena,
+) -> usize {
+    if sort_keys.is_empty() {
+        return partition.len() - 1;
+    }
+    let mut end = pos;
+    while end + 1 < partition.len() {
+        if compare_rows(sort_keys, &rows[partition[pos]], &rows[partition[end + 1]], arena)
+            != std::cmp::Ordering::Equal
+        {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
 /// Compute value function results (LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE)
 /// for one partition.
 fn compute_value(
     kind: &WindowFuncKind,
     partition: &[usize],
+    sort_keys: &[SortKey],
     rows: &[Vec<ArenaValue>],
     ctx: &JoinContext,
     arena: &mut QueryArena,
@@ -372,19 +397,22 @@ fn compute_value(
             }
         }
         WindowFuncKind::LastValue { expr } => {
-            // Default frame: UNBOUNDED PRECEDING to CURRENT ROW
-            // LAST_VALUE returns the value at the current row position
+            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // In RANGE mode, CURRENT ROW means the last peer row
             for (pos, &row_idx) in partition.iter().enumerate() {
-                let current_row = partition[pos];
-                let val = eval_expr(expr, &rows[current_row], ctx, arena)?;
+                let peer_end = last_peer_pos(pos, partition, sort_keys, rows, arena);
+                let target_row = partition[peer_end];
+                let val = eval_expr(expr, &rows[target_row], ctx, arena)?;
                 results[row_idx][wf_idx] = val;
             }
         }
         WindowFuncKind::NthValue { expr, n } => {
-            // Default frame: UNBOUNDED PRECEDING to CURRENT ROW
+            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // In RANGE mode, frame end is the last peer row
             let target_pos = (*n - 1) as usize; // 1-indexed to 0-indexed
             for (pos, &row_idx) in partition.iter().enumerate() {
-                let val = if target_pos <= pos {
+                let peer_end = last_peer_pos(pos, partition, sort_keys, rows, arena);
+                let val = if target_pos <= peer_end {
                     let target_row = partition[target_pos];
                     eval_expr(expr, &rows[target_row], ctx, arena)?
                 } else {
