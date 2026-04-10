@@ -2558,6 +2558,8 @@ fn execute_from(node: &NodeEnum, arena: &mut QueryArena) -> Result<(Vec<Vec<Aren
                 .unwrap_or_else(|| rv.relname.clone());
 
             // Check CTE registry first (CTEs shadow real tables per SQL standard)
+            // Only unqualified names - schema-qualified refs (e.g. public.foo) bypass CTEs
+            if rv.schemaname.is_empty() {
             if let Some(cte) = arena.cte_registry.get(&rv.relname) {
                 // Clone CTE data out before mutable arena borrow for rows_to_arena
                 let cte_value_rows = cte.rows.clone();
@@ -2587,6 +2589,7 @@ fn execute_from(node: &NodeEnum, arena: &mut QueryArena) -> Result<(Vec<Vec<Aren
                 };
                 return Ok((rows, ctx));
             }
+            } // end schema check for CTE
 
             let schema = if rv.schemaname.is_empty() {
                 "public"
@@ -3239,7 +3242,7 @@ fn exec_select_raw(
     // Skip fast path if the table name matches a CTE (CTEs have no storage backing).
     if select.from_clause.len() == 1 && outer.is_none() {
         if let Some(NodeEnum::RangeVar(rv)) = select.from_clause[0].node.as_ref() {
-            if arena.cte_registry.contains_key(&rv.relname) {
+            if rv.schemaname.is_empty() && arena.cte_registry.contains_key(&rv.relname) {
                 // Fall through to general path which handles CTE lookup in execute_from
             } else {
             let schema = if rv.schemaname.is_empty() { "public" } else { &rv.schemaname };
