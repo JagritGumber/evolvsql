@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 /// Materialized CTE result stored in the query arena.
+/// Uses Value (heap-allocated) instead of ArenaValue so CTE data is
+/// self-contained and independent of any arena's byte/float buffers.
 #[derive(Debug, Clone)]
 pub(crate) struct CteEntry {
     pub columns: Vec<(String, i32)>,
-    pub rows: Vec<Vec<ArenaValue>>,
+    pub rows: Vec<Vec<crate::types::Value>>,
 }
 
 /// Per-query byte arena. Strings and vectors are packed contiguously.

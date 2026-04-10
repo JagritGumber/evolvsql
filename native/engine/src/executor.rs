@@ -2559,7 +2559,8 @@ fn execute_from(node: &NodeEnum, arena: &mut QueryArena) -> Result<(Vec<Vec<Aren
 
             // Check CTE registry first (CTEs shadow real tables per SQL standard)
             if let Some(cte) = arena.cte_registry.get(&rv.relname) {
-                let rows = cte.rows.clone();
+                // Clone CTE data out before mutable arena borrow for rows_to_arena
+                let cte_value_rows = cte.rows.clone();
                 let columns: Vec<Column> = cte.columns.iter()
                     .map(|(name, oid)| Column {
                         name: name.clone(),
@@ -2570,6 +2571,8 @@ fn execute_from(node: &NodeEnum, arena: &mut QueryArena) -> Result<(Vec<Vec<Aren
                         default_expr: None,
                     })
                     .collect();
+                drop(cte); // release immutable borrow
+                let rows = rows_to_arena(&cte_value_rows, arena);
                 let ncols = columns.len();
                 let table_def = Table { name: alias.clone(), schema: String::new(), columns };
                 let ctx = JoinContext {
@@ -3135,9 +3138,14 @@ fn exec_select_raw(
                         }
                     }
                 }
+                // Convert ArenaValue rows to self-contained Value rows
+                // so CTE data is independent of this arena's buffers
+                let value_rows: Vec<Vec<Value>> = rows.iter()
+                    .map(|row| row.iter().map(|v| v.to_value(arena)).collect())
+                    .collect();
                 arena.cte_registry.insert(
                     cte.ctename.clone(),
-                    crate::arena::CteEntry { columns: cols, rows },
+                    crate::arena::CteEntry { columns: cols, rows: value_rows },
                 );
             }
         }
@@ -7239,6 +7247,23 @@ mod tests {
         ).unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cte_text_in_subquery() {
+        setup();
+        execute("CREATE TABLE cte_txt (id int, name text)").unwrap();
+        execute("INSERT INTO cte_txt VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO cte_txt VALUES (2, 'bob')").unwrap();
+        // CTE with text data referenced in WHERE subquery - tests that
+        // ArenaValue text offsets don't dangle across arena boundaries
+        let r = execute(
+            "WITH names AS (SELECT 'alice' AS n) \
+             SELECT * FROM cte_txt WHERE name IN (SELECT n FROM names)",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Some("alice".into()));
     }
 
     #[test]
