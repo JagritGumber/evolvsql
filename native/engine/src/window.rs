@@ -24,6 +24,7 @@ pub(crate) enum WindowFuncKind {
     FirstValue { expr: NodeEnum },
     LastValue { expr: NodeEnum },
     NthValue { expr: NodeEnum, n: i64 },
+    AggregateOver { name: String, expr: Option<NodeEnum>, agg_star: bool },
 }
 
 pub(crate) struct WindowTarget {
@@ -146,6 +147,16 @@ pub(crate) fn extract_window_targets(
                             }
                             WindowFuncKind::NthValue { expr: expr_node, n }
                         }
+                        "count" | "sum" | "avg" | "min" | "max" => {
+                            let expr_node = fc.args.first()
+                                .and_then(|a| a.node.as_ref())
+                                .cloned();
+                            WindowFuncKind::AggregateOver {
+                                name: name.clone(),
+                                expr: expr_node,
+                                agg_star: fc.agg_star,
+                            }
+                        }
                         _ => {
                             let _ = arena;
                             return Err(format!(
@@ -243,6 +254,9 @@ pub(crate) fn evaluate_window_functions(
                 | WindowFuncKind::DenseRank
                 | WindowFuncKind::Ntile(_) => {
                     compute_ranking(&wt.kind, partition, &wt.spec.sort_keys, rows, arena, wf_idx, &mut results);
+                }
+                WindowFuncKind::AggregateOver { .. } => {
+                    compute_aggregate_window(&wt.kind, partition, &wt.spec.sort_keys, rows, ctx, arena, wf_idx, &mut results)?;
                 }
                 _ => {
                     compute_value(&wt.kind, partition, &wt.spec.sort_keys, rows, ctx, arena, wf_idx, &mut results)?;
@@ -424,4 +438,121 @@ fn compute_value(
         _ => {}
     }
     Ok(())
+}
+
+/// Compute aggregate window function (SUM/COUNT/AVG/MIN/MAX OVER).
+/// Uses default RANGE frame: UNBOUNDED PRECEDING to CURRENT ROW with peer groups.
+fn compute_aggregate_window(
+    kind: &WindowFuncKind,
+    partition: &[usize],
+    sort_keys: &[SortKey],
+    rows: &[Vec<ArenaValue>],
+    ctx: &JoinContext,
+    arena: &mut QueryArena,
+    wf_idx: usize,
+    results: &mut [Vec<ArenaValue>],
+) -> Result<(), String> {
+    let (name, expr, agg_star) = match kind {
+        WindowFuncKind::AggregateOver { name, expr, agg_star } => (name.as_str(), expr, *agg_star),
+        _ => return Ok(()),
+    };
+
+    // Evaluate expressions for all rows in partition order
+    let vals: Vec<ArenaValue> = if agg_star {
+        vec![ArenaValue::Int(1); partition.len()]
+    } else if let Some(expr_node) = expr {
+        let mut v = Vec::with_capacity(partition.len());
+        for &row_idx in partition.iter() {
+            v.push(eval_expr(expr_node, &rows[row_idx], ctx, arena)?);
+        }
+        v
+    } else {
+        return Err(format!("{} requires an argument", name.to_uppercase()));
+    };
+
+    // Compute running aggregate with RANGE peer group handling.
+    // All peers share the same accumulated value (inclusive of all peers).
+    let mut pos = 0usize;
+    while pos < partition.len() {
+        let peer_end = last_peer_pos(pos, partition, sort_keys, rows, arena);
+        // Frame: all values from 0..=peer_end
+        let frame_vals = &vals[0..=peer_end];
+        let agg_val = compute_frame_aggregate(name, frame_vals, arena)?;
+        for i in pos..=peer_end {
+            results[partition[i]][wf_idx] = agg_val;
+        }
+        pos = peer_end + 1;
+    }
+
+    Ok(())
+}
+
+/// Compute an aggregate over a frame slice of pre-evaluated values.
+fn compute_frame_aggregate(
+    name: &str,
+    vals: &[ArenaValue],
+    arena: &QueryArena,
+) -> Result<ArenaValue, String> {
+    match name {
+        "count" => {
+            let count = vals.iter().filter(|v| !v.is_null()).count();
+            Ok(ArenaValue::Int(count as i64))
+        }
+        "sum" => {
+            let mut si: i64 = 0;
+            let mut sf: f64 = 0.0;
+            let mut is_float = false;
+            let mut any = false;
+            for v in vals {
+                match v {
+                    ArenaValue::Int(n) => { si = si.wrapping_add(*n); any = true; }
+                    ArenaValue::Float(f) => { sf += f; is_float = true; any = true; }
+                    ArenaValue::Null => {}
+                    _ => return Err("SUM requires numeric input".into()),
+                }
+            }
+            if !any { return Ok(ArenaValue::Null); }
+            Ok(if is_float { ArenaValue::Float(sf + si as f64) } else { ArenaValue::Int(si) })
+        }
+        "avg" => {
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+            for v in vals {
+                match v {
+                    ArenaValue::Int(n) => { sum += *n as f64; count += 1; }
+                    ArenaValue::Float(f) => { sum += f; count += 1; }
+                    ArenaValue::Null => {}
+                    _ => return Err("AVG requires numeric input".into()),
+                }
+            }
+            if count == 0 { Ok(ArenaValue::Null) } else { Ok(ArenaValue::Float(sum / count as f64)) }
+        }
+        "min" => {
+            let mut best: Option<ArenaValue> = None;
+            for v in vals {
+                if v.is_null() { continue; }
+                best = Some(match best {
+                    None => *v,
+                    Some(cur) => {
+                        if v.compare(&cur, arena) == Some(std::cmp::Ordering::Less) { *v } else { cur }
+                    }
+                });
+            }
+            Ok(best.unwrap_or(ArenaValue::Null))
+        }
+        "max" => {
+            let mut best: Option<ArenaValue> = None;
+            for v in vals {
+                if v.is_null() { continue; }
+                best = Some(match best {
+                    None => *v,
+                    Some(cur) => {
+                        if v.compare(&cur, arena) == Some(std::cmp::Ordering::Greater) { *v } else { cur }
+                    }
+                });
+            }
+            Ok(best.unwrap_or(ArenaValue::Null))
+        }
+        _ => Err(format!("aggregate window function \"{}\" not supported", name)),
+    }
 }

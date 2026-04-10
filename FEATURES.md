@@ -135,7 +135,7 @@ Each feature is categorized by priority tier and assigned to a layer (BEAM or Ru
 - [ ] LATERAL joins (PG 9.3)
 - [x] Window functions (ranking) — ROW_NUMBER, RANK, DENSE_RANK, NTILE with PARTITION BY + ORDER BY (PG 8.4)
 - [x] Window functions (value) — LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE (PG 8.4)
-- [ ] Window functions (aggregate) — SUM/COUNT/AVG/MIN/MAX OVER (...) (PG 8.4)
+- [x] Window functions (aggregate) — SUM/COUNT/AVG/MIN/MAX OVER (...) (PG 8.4)
 - [ ] Window RANGE/GROUPS modes, frame exclusion (PG 11)
 - [ ] GROUPING SETS, CUBE, ROLLUP (PG 9.5)
 - [ ] FETCH FIRST ... WITH TIES (PG 13)
