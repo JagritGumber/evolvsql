@@ -406,6 +406,9 @@ pub fn insert_upsert(
                 let new_row = updater(existing, &row)?;
                 affected_rows.push(new_row.clone());
                 table.rows[idx] = new_row;
+                // Rebuild indexes immediately so subsequent rows in this
+                // batch see up-to-date unique constraints
+                rebuild_indexes(&mut table);
                 updated += 1;
             }
             Some(_) => {
@@ -414,8 +417,8 @@ pub fn insert_upsert(
         }
     }
 
-    // Rebuild indexes after mutations
-    if updated > 0 {
+    // Rebuild indexes if any inserts occurred (for HNSW vector index)
+    if inserted > 0 {
         rebuild_indexes(&mut table);
     }
 

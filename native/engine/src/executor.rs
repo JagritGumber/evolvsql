@@ -1074,6 +1074,7 @@ fn apply_on_conflict_update(
         new_row[col_idx] = val.to_value(&arena);
     }
 
+    check_not_null(table, &new_row)?;
     Ok(new_row)
 }
 
