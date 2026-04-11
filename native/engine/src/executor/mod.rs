@@ -40,10 +40,11 @@ mod insert_conflict;
 mod delete;
 mod update;
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 
-use parking_lot::RwLock;
+use lru::LruCache;
+use parking_lot::Mutex;
 use pg_query::NodeEnum;
 
 pub use types::QueryResult;
@@ -54,21 +55,18 @@ pub(crate) use helpers::eval_const_i64;
 pub(crate) use sort::compare_rows;
 
 const MAX_PARSE_CACHE: usize = 1024;
-static PARSE_CACHE: LazyLock<RwLock<HashMap<String, pg_query::protobuf::ParseResult>>> =
-    LazyLock::new(|| RwLock::new(HashMap::with_capacity(MAX_PARSE_CACHE)));
+static PARSE_CACHE: LazyLock<Mutex<LruCache<String, pg_query::protobuf::ParseResult>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(MAX_PARSE_CACHE).unwrap())));
 
 pub fn execute(sql: &str) -> Result<QueryResult, String> {
     let protobuf = {
-        let cache = PARSE_CACHE.read();
+        let mut cache = PARSE_CACHE.lock();
         if let Some(cached) = cache.get(sql) {
             cached.clone()
         } else {
-            drop(cache);
             let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
             let proto = parsed.protobuf;
-            let mut cache = PARSE_CACHE.write();
-            if cache.len() >= MAX_PARSE_CACHE { cache.clear(); }
-            cache.insert(sql.to_string(), proto.clone());
+            cache.put(sql.to_string(), proto.clone());
             proto
         }
     };
