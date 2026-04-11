@@ -22,6 +22,8 @@ defmodule Wire.Listener do
       # PG wire protocol messages are typically < 8KB
     ]
 
+    Wire.ConnCounter.init()
+
     case :gen_tcp.listen(port, tcp_opts) do
       {:ok, socket} ->
         Logger.info("evolvsql listening on port #{port}")
@@ -37,8 +39,14 @@ defmodule Wire.Listener do
   def handle_info(:accept, %{socket: socket} = state) do
     case :gen_tcp.accept(socket, 1000) do
       {:ok, client} ->
-        {:ok, pid} = Wire.Connection.start(client)
-        :gen_tcp.controlling_process(client, pid)
+        case Wire.ConnCounter.try_acquire() do
+          :ok ->
+            {:ok, pid} = Wire.Connection.start(client)
+            :gen_tcp.controlling_process(client, pid)
+
+          {:error, :too_many_connections} ->
+            reject_connection(client)
+        end
 
       {:error, :timeout} ->
         :ok
@@ -49,5 +57,16 @@ defmodule Wire.Listener do
 
     send(self(), :accept)
     {:noreply, state}
+  end
+
+  defp reject_connection(client) do
+    # Send PG error response: too many connections
+    msg =
+      <<"S", "FATAL", 0, "C", "53300", 0, "M",
+        "too many connections", 0, 0>>
+
+    :gen_tcp.send(client, <<"E", byte_size(msg) + 4::32, msg::binary>>)
+    :gen_tcp.close(client)
+    Logger.warning("Rejected connection: limit reached")
   end
 end
