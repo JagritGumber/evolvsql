@@ -897,11 +897,17 @@ fn exec_insert(
         } else {
             Vec::new()
         };
+        // Parse conflict target columns from InferClause
+        let conflict_cols: Vec<usize> = if let Some(ref infer) = oc.infer {
+            parse_conflict_columns(&infer.index_elems, &table_def)?
+        } else {
+            Vec::new() // empty = check all unique/PK constraints
+        };
         let td_clone = table_def.clone();
 
         let (inserted, updated, affected_rows) = storage::insert_upsert(
             schema, table_name, all_rows, &unique_checks, &pk_cols,
-            do_update,
+            &conflict_cols, do_update,
             |existing, excluded| {
                 apply_on_conflict_update(existing, excluded, &set_clauses, &td_clone)
             },
@@ -996,6 +1002,23 @@ fn build_unique_checks(table: &Table) -> (Vec<(usize, String)>, Vec<usize>) {
     }
 
     (unique_checks, pk_cols)
+}
+
+/// Parse ON CONFLICT (col1, col2) conflict target into column indices.
+fn parse_conflict_columns(
+    index_elems: &[pg_query::protobuf::Node],
+    table: &Table,
+) -> Result<Vec<usize>, String> {
+    let mut cols = Vec::new();
+    for elem in index_elems {
+        if let Some(NodeEnum::IndexElem(ie)) = elem.node.as_ref() {
+            let col_idx = table.columns.iter()
+                .position(|c| c.name == ie.name)
+                .ok_or_else(|| format!("column \"{}\" does not exist", ie.name))?;
+            cols.push(col_idx);
+        }
+    }
+    Ok(cols)
 }
 
 /// Parse ON CONFLICT DO UPDATE SET clauses into (col_idx, expr) pairs.

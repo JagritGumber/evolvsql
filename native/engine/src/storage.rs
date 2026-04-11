@@ -19,13 +19,13 @@ type Row = Vec<Value>;
 
 struct TableStore {
     rows: Vec<Row>,
-    /// Hash indexes for unique constraints: column_index -> set of values.
-    /// O(1) constraint checks instead of O(N) full table scan.
-    unique_indexes: HashMap<usize, HashSet<Value>>,
+    /// Hash indexes for unique constraints: column_index -> value -> row_index.
+    /// O(1) constraint checks and O(1) conflicting row lookup.
+    unique_indexes: HashMap<usize, HashMap<Value, usize>>,
     /// Composite PK column indices (stored for index rebuild).
     pk_cols: Vec<usize>,
-    /// Composite PK index: set of composite key tuples.
-    pk_index: Option<HashSet<Vec<Value>>>,
+    /// Composite PK index: composite key -> row_index.
+    pk_index: Option<HashMap<Vec<Value>, usize>>,
     /// Optional HNSW index for vector KNN queries.
     hnsw_index: Option<HnswIndex>,
 }
@@ -62,10 +62,10 @@ pub fn create_table(schema: &str, name: &str) {
 pub fn add_unique_index(schema: &str, name: &str, col_idx: usize) -> Result<(), String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
-    let mut idx = HashSet::new();
-    for row in &table.rows {
+    let mut idx = HashMap::new();
+    for (row_idx, row) in table.rows.iter().enumerate() {
         if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
-            idx.insert(row[col_idx].clone());
+            idx.insert(row[col_idx].clone(), row_idx);
         }
     }
     table.unique_indexes.insert(col_idx, idx);
@@ -76,10 +76,10 @@ pub fn add_unique_index(schema: &str, name: &str, col_idx: usize) -> Result<(), 
 pub fn add_pk_index(schema: &str, name: &str, pk_cols: &[usize]) -> Result<(), String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
-    let mut idx = HashSet::new();
-    for row in &table.rows {
+    let mut idx = HashMap::new();
+    for (row_idx, row) in table.rows.iter().enumerate() {
         let key: Vec<Value> = pk_cols.iter().map(|&i| row[i].clone()).collect();
-        idx.insert(key);
+        idx.insert(key, row_idx);
     }
     table.pk_cols = pk_cols.to_vec();
     table.pk_index = Some(idx);
@@ -175,16 +175,16 @@ pub fn delete_where_returning(
 // ── Index maintenance helpers ─────────────────────────────────────────
 
 /// Add a row's values to all applicable indexes.
-fn add_to_indexes(table: &mut TableStore, row: &Row) {
+fn add_to_indexes(table: &mut TableStore, row: &Row, row_idx: usize) {
     for (&col_idx, idx) in table.unique_indexes.iter_mut() {
         if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
-            idx.insert(row[col_idx].clone());
+            idx.insert(row[col_idx].clone(), row_idx);
         }
     }
     if table.pk_cols.len() > 1 {
         if let Some(pk_idx) = &mut table.pk_index {
             let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
-            pk_idx.insert(key);
+            pk_idx.insert(key, row_idx);
         }
     }
 }
@@ -194,17 +194,17 @@ fn add_to_indexes(table: &mut TableStore, row: &Row) {
 fn rebuild_indexes(table: &mut TableStore) {
     for (&col_idx, idx) in table.unique_indexes.iter_mut() {
         idx.clear();
-        for row in &table.rows {
+        for (row_idx, row) in table.rows.iter().enumerate() {
             if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
-                idx.insert(row[col_idx].clone());
+                idx.insert(row[col_idx].clone(), row_idx);
             }
         }
     }
     if let Some(pk_idx) = &mut table.pk_index {
         pk_idx.clear();
-        for row in &table.rows {
+        for (row_idx, row) in table.rows.iter().enumerate() {
             let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
-            pk_idx.insert(key);
+            pk_idx.insert(key, row_idx);
         }
     }
     // Rebuild HNSW index — row_ids are positional, so any row shift invalidates them
@@ -247,11 +247,11 @@ pub fn insert_checked(
         }
     }
 
-    // Composite PK check — O(1) via hash index
+    // Composite PK check - O(1) via hash index
     if pk_cols.len() > 1 {
         if let Some(ref pk_idx) = table.pk_index {
             let key: Vec<Value> = pk_cols.iter().map(|&i| row[i].clone()).collect();
-            if pk_idx.contains(&key) {
+            if pk_idx.contains_key(&key) {
                 return Err(format!(
                     "duplicate key value violates unique constraint \"{}.{}_pkey\"",
                     schema, name
@@ -260,13 +260,13 @@ pub fn insert_checked(
         }
     }
 
-    // Per-column unique checks — O(1) via hash index
+    // Per-column unique checks - O(1) via hash index
     for &(col_idx, ref cname) in unique_checks {
         if matches!(row[col_idx], Value::Null) {
             continue; // NULLs don't violate UNIQUE
         }
         if let Some(idx) = table.unique_indexes.get(&col_idx) {
-            if idx.contains(&row[col_idx]) {
+            if idx.contains_key(&row[col_idx]) {
                 return Err(format!(
                     "duplicate key value violates unique constraint \"{}\"",
                     cname
@@ -276,7 +276,8 @@ pub fn insert_checked(
     }
 
     // Update indexes after successful validation
-    add_to_indexes(&mut table, &row);
+    let row_idx = table.rows.len();
+    add_to_indexes(&mut table, &row, row_idx);
     table.rows.push(row);
     Ok(())
 }
@@ -309,11 +310,11 @@ pub fn insert_batch_checked(
             }
         }
 
-        // Composite PK check — O(1) against index + batch set
+        // Composite PK check - O(1) against index + batch set
         if pk_cols.len() > 1 {
             let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
             if let Some(ref pk_idx) = table.pk_index {
-                if pk_idx.contains(&key) {
+                if pk_idx.contains_key(&key) {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}.{}_pkey\"",
                         schema, name
@@ -328,13 +329,13 @@ pub fn insert_batch_checked(
             }
         }
 
-        // Per-column unique checks — O(1) against index + batch set
+        // Per-column unique checks - O(1) against index + batch set
         for &(col_idx, ref cname) in unique_checks {
             if matches!(row[col_idx], Value::Null) {
                 continue;
             }
             if let Some(idx) = table.unique_indexes.get(&col_idx) {
-                if idx.contains(&row[col_idx]) {
+                if idx.contains_key(&row[col_idx]) {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}\"",
                         cname
@@ -351,26 +352,21 @@ pub fn insert_batch_checked(
         }
     }
 
-    // All validated — push all atomically and update indexes
+    // All validated - push all atomically and update indexes
     let base_row_id = table.rows.len();
-    for row in rows {
-        add_to_indexes(&mut table, &row);
+    for (i, row) in rows.into_iter().enumerate() {
+        add_to_indexes(&mut table, &row, base_row_id + i);
         table.rows.push(row);
     }
     Ok(base_row_id)
 }
 
-/// Result of an upsert operation for a single row.
-pub enum UpsertAction {
-    Inserted,
-    Updated(usize),  // index of the conflicting row that was updated
-    Skipped,         // DO NOTHING
-}
-
 /// Insert rows with ON CONFLICT handling. For each row:
-/// - If no conflict: insert normally
+/// - If no conflict on specified columns: insert normally
 /// - If conflict + DO NOTHING: skip
 /// - If conflict + DO UPDATE: call updater on conflicting row
+/// conflict_cols: column indices to check for conflicts (from ON CONFLICT (col) clause).
+/// If empty, checks all unique/PK constraints.
 /// Returns (inserted_count, updated_count, all affected rows for RETURNING).
 pub fn insert_upsert(
     schema: &str,
@@ -378,8 +374,9 @@ pub fn insert_upsert(
     rows: Vec<Row>,
     unique_checks: &[(usize, String)],
     pk_cols: &[usize],
+    conflict_cols: &[usize],
     do_update: bool,
-    mut updater: impl FnMut(&Row, &Row) -> Result<Row, String>, // (existing, excluded) -> new
+    mut updater: impl FnMut(&Row, &Row) -> Result<Row, String>,
 ) -> Result<(u64, u64, Vec<Row>), String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
@@ -389,26 +386,25 @@ pub fn insert_upsert(
     let mut affected_rows: Vec<Row> = Vec::new();
 
     for row in rows {
-        // Check for conflict against existing data
-        let conflict_idx = find_conflict(&table, &row, unique_checks, pk_cols);
+        let conflict_idx = find_conflict(&table, &row, unique_checks, pk_cols, conflict_cols);
 
         match conflict_idx {
             None => {
-                // No conflict: insert
+                let row_idx = table.rows.len();
                 affected_rows.push(row.clone());
-                add_to_indexes(&mut table, &row);
+                add_to_indexes(&mut table, &row, row_idx);
                 table.rows.push(row);
                 inserted += 1;
             }
             Some(idx) if do_update => {
-                // Conflict + DO UPDATE
                 let existing = &table.rows[idx];
                 let new_row = updater(existing, &row)?;
                 affected_rows.push(new_row.clone());
+                // Targeted index update: remove old values, set new row, add new values
+                remove_from_indexes(&mut table, idx);
                 table.rows[idx] = new_row;
-                // Rebuild indexes immediately so subsequent rows in this
-                // batch see up-to-date unique constraints
-                rebuild_indexes(&mut table);
+                let row_ref = table.rows[idx].clone();
+                add_to_indexes(&mut table, &row_ref, idx);
                 updated += 1;
             }
             Some(_) => {
@@ -417,42 +413,82 @@ pub fn insert_upsert(
         }
     }
 
-    // Rebuild indexes if any inserts occurred (for HNSW vector index)
-    if inserted > 0 {
-        rebuild_indexes(&mut table);
+    // Rebuild HNSW if any mutations (HNSW needs full rebuild since row positions matter)
+    if (inserted > 0 || updated > 0) && table.hnsw_index.is_some() {
+        rebuild_hnsw(&mut table);
     }
 
     Ok((inserted, updated, affected_rows))
 }
 
+/// Remove a row's values from unique/PK indexes (before update or delete).
+fn remove_from_indexes(table: &mut TableStore, row_idx: usize) {
+    let row = &table.rows[row_idx];
+    for (&col_idx, idx) in table.unique_indexes.iter_mut() {
+        if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
+            idx.remove(&row[col_idx]);
+        }
+    }
+    if table.pk_cols.len() > 1 {
+        if let Some(pk_idx) = &mut table.pk_index {
+            let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
+            pk_idx.remove(&key);
+        }
+    }
+}
+
+/// Rebuild only the HNSW vector index (row positions are positional).
+fn rebuild_hnsw(table: &mut TableStore) {
+    if let Some(ref old_hnsw) = table.hnsw_index {
+        let col_idx = old_hnsw.col_idx();
+        let metric = old_hnsw.metric();
+        let mut new_hnsw = crate::hnsw::HnswIndex::new(metric, col_idx);
+        for (i, row) in table.rows.iter().enumerate() {
+            if col_idx < row.len() {
+                if let Value::Vector(v) = &row[col_idx] {
+                    new_hnsw.insert(i, v.clone());
+                }
+            }
+        }
+        table.hnsw_index = Some(new_hnsw);
+    }
+}
+
 /// Find the index of a conflicting row, if any.
+/// Uses O(1) hash index lookup for both detection and row position.
+/// conflict_cols: only check these columns. If empty, check all unique/PK.
 fn find_conflict(
     table: &TableStore,
     row: &Row,
     unique_checks: &[(usize, String)],
     pk_cols: &[usize],
+    conflict_cols: &[usize],
 ) -> Option<usize> {
-    // Check composite PK
+    // Check composite PK (only if conflict_cols is empty or matches PK)
     if pk_cols.len() > 1 {
-        let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
-        if let Some(ref pk_idx) = table.pk_index {
-            if pk_idx.contains(&key) {
-                // Find the actual row index
-                return table.rows.iter().position(|r| {
-                    pk_cols.iter().all(|&ci| r[ci] == row[ci])
-                });
+        let pk_matches = conflict_cols.is_empty()
+            || conflict_cols.iter().all(|c| pk_cols.contains(c));
+        if pk_matches {
+            let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
+            if let Some(ref pk_idx) = table.pk_index {
+                if let Some(&row_idx) = pk_idx.get(&key) {
+                    return Some(row_idx);
+                }
             }
         }
     }
 
-    // Check per-column unique constraints (including single-column PK)
+    // Check per-column unique constraints
     for &(col_idx, _) in unique_checks {
+        if !conflict_cols.is_empty() && !conflict_cols.contains(&col_idx) {
+            continue; // skip constraints not in the conflict target
+        }
         if matches!(row[col_idx], Value::Null) {
             continue;
         }
         if let Some(idx) = table.unique_indexes.get(&col_idx) {
-            if idx.contains(&row[col_idx]) {
-                return table.rows.iter().position(|r| r[col_idx] == row[col_idx]);
+            if let Some(&row_idx) = idx.get(&row[col_idx]) {
+                return Some(row_idx);
             }
         }
     }
