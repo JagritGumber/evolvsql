@@ -381,30 +381,52 @@ pub fn insert_upsert(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
 
+    // Atomic: work on a clone, swap only if all rows succeed
+    let mut working_rows = table.rows.clone();
+    let mut working_indexes = table.unique_indexes.clone();
+    let mut working_pk = table.pk_index.clone();
+    let pk_cols_vec = table.pk_cols.clone();
+
     let mut inserted: u64 = 0;
     let mut updated: u64 = 0;
     let mut affected_rows: Vec<Row> = Vec::new();
 
     for row in rows {
-        let conflict_idx = find_conflict(&table, &row, unique_checks, pk_cols, conflict_cols);
+        let conflict_idx = find_conflict_on(
+            &working_rows, &working_indexes, &working_pk, &pk_cols_vec,
+            &row, unique_checks, pk_cols, conflict_cols,
+        );
 
         match conflict_idx {
             None => {
-                let row_idx = table.rows.len();
+                // Validate ALL unique constraints before inserting (not just conflict target)
+                check_all_unique(
+                    &working_indexes, &working_pk, &pk_cols_vec,
+                    &row, unique_checks, pk_cols,
+                )?;
+                let row_idx = working_rows.len();
+                add_to_working_indexes(
+                    &mut working_indexes, &mut working_pk, &pk_cols_vec,
+                    &row, row_idx,
+                );
                 affected_rows.push(row.clone());
-                add_to_indexes(&mut table, &row, row_idx);
-                table.rows.push(row);
+                working_rows.push(row);
                 inserted += 1;
             }
             Some(idx) if do_update => {
-                let existing = &table.rows[idx];
+                let existing = &working_rows[idx];
                 let new_row = updater(existing, &row)?;
-                affected_rows.push(new_row.clone());
-                // Targeted index update: remove old values, set new row, add new values
-                remove_from_indexes(&mut table, idx);
-                table.rows[idx] = new_row;
-                let row_ref = table.rows[idx].clone();
-                add_to_indexes(&mut table, &row_ref, idx);
+                // Remove old values from working indexes
+                remove_from_working_indexes(
+                    &mut working_indexes, &mut working_pk, &pk_cols_vec,
+                    &working_rows[idx], idx,
+                );
+                working_rows[idx] = new_row.clone();
+                add_to_working_indexes(
+                    &mut working_indexes, &mut working_pk, &pk_cols_vec,
+                    &new_row, idx,
+                );
+                affected_rows.push(new_row);
                 updated += 1;
             }
             Some(_) => {
@@ -413,9 +435,15 @@ pub fn insert_upsert(
         }
     }
 
-    // Rebuild HNSW if any mutations (HNSW needs full rebuild since row positions matter)
-    if (inserted > 0 || updated > 0) && table.hnsw_index.is_some() {
-        rebuild_hnsw(&mut table);
+    // All rows succeeded - commit atomically
+    if inserted > 0 || updated > 0 {
+        table.rows = working_rows;
+        table.unique_indexes = working_indexes;
+        table.pk_index = working_pk;
+        // HNSW needs full rebuild since row positions matter
+        if table.hnsw_index.is_some() {
+            rebuild_hnsw(&mut table);
+        }
     }
 
     Ok((inserted, updated, affected_rows))
@@ -452,6 +480,115 @@ fn rebuild_hnsw(table: &mut TableStore) {
         }
         table.hnsw_index = Some(new_hnsw);
     }
+}
+
+/// Add a row's values to working (cloned) indexes.
+fn add_to_working_indexes(
+    unique_indexes: &mut HashMap<usize, HashMap<Value, usize>>,
+    pk_index: &mut Option<HashMap<Vec<Value>, usize>>,
+    pk_cols: &[usize],
+    row: &Row,
+    row_idx: usize,
+) {
+    for (&col_idx, idx) in unique_indexes.iter_mut() {
+        if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
+            idx.insert(row[col_idx].clone(), row_idx);
+        }
+    }
+    if pk_cols.len() > 1 {
+        if let Some(pk_idx) = pk_index {
+            let key: Vec<Value> = pk_cols.iter().map(|&i| row[i].clone()).collect();
+            pk_idx.insert(key, row_idx);
+        }
+    }
+}
+
+/// Remove a row's values from working (cloned) indexes.
+fn remove_from_working_indexes(
+    unique_indexes: &mut HashMap<usize, HashMap<Value, usize>>,
+    pk_index: &mut Option<HashMap<Vec<Value>, usize>>,
+    pk_cols: &[usize],
+    row: &Row,
+    _row_idx: usize,
+) {
+    for (&col_idx, idx) in unique_indexes.iter_mut() {
+        if col_idx < row.len() && !matches!(row[col_idx], Value::Null) {
+            idx.remove(&row[col_idx]);
+        }
+    }
+    if pk_cols.len() > 1 {
+        if let Some(pk_idx) = pk_index {
+            let key: Vec<Value> = pk_cols.iter().map(|&i| row[i].clone()).collect();
+            pk_idx.remove(&key);
+        }
+    }
+}
+
+/// Validate ALL unique constraints for a row (not filtered by conflict target).
+fn check_all_unique(
+    unique_indexes: &HashMap<usize, HashMap<Value, usize>>,
+    pk_index: &Option<HashMap<Vec<Value>, usize>>,
+    pk_cols: &[usize],
+    row: &Row,
+    unique_checks: &[(usize, String)],
+    all_pk_cols: &[usize],
+) -> Result<(), String> {
+    if all_pk_cols.len() > 1 {
+        let key: Vec<Value> = all_pk_cols.iter().map(|&ci| row[ci].clone()).collect();
+        if let Some(pk_idx) = pk_index {
+            if pk_idx.contains_key(&key) {
+                return Err("duplicate key value violates unique constraint (pkey)".into());
+            }
+        }
+    }
+    for &(col_idx, ref cname) in unique_checks {
+        if matches!(row[col_idx], Value::Null) { continue; }
+        if let Some(idx) = unique_indexes.get(&col_idx) {
+            if idx.contains_key(&row[col_idx]) {
+                return Err(format!(
+                    "duplicate key value violates unique constraint \"{}\"", cname
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Find conflict on working (cloned) state. O(1) via hash index.
+fn find_conflict_on(
+    _rows: &[Row],
+    unique_indexes: &HashMap<usize, HashMap<Value, usize>>,
+    pk_index: &Option<HashMap<Vec<Value>, usize>>,
+    pk_cols_vec: &[usize],
+    row: &Row,
+    unique_checks: &[(usize, String)],
+    pk_cols: &[usize],
+    conflict_cols: &[usize],
+) -> Option<usize> {
+    if pk_cols.len() > 1 {
+        let pk_matches = conflict_cols.is_empty()
+            || conflict_cols.iter().all(|c| pk_cols.contains(c));
+        if pk_matches {
+            let key: Vec<Value> = pk_cols_vec.iter().map(|&ci| row[ci].clone()).collect();
+            if let Some(pk_idx) = pk_index {
+                if let Some(&row_idx) = pk_idx.get(&key) {
+                    return Some(row_idx);
+                }
+            }
+        }
+    }
+    for &(col_idx, _) in unique_checks {
+        if !conflict_cols.is_empty() && !conflict_cols.contains(&col_idx) {
+            continue;
+        }
+        if matches!(row[col_idx], Value::Null) { continue; }
+        if let Some(idx) = unique_indexes.get(&col_idx) {
+            if let Some(&row_idx) = idx.get(&row[col_idx]) {
+                return Some(row_idx);
+            }
+        }
+    }
+    None
 }
 
 /// Find the index of a conflicting row, if any.
