@@ -115,7 +115,7 @@ Each feature is categorized by priority tier and assigned to a layer (BEAM or Ru
 - [ ] INSERT ... RETURNING (PG 8.2)
 - [ ] UPDATE ... RETURNING (PG 8.2)
 - [ ] DELETE ... RETURNING (PG 8.2)
-- [ ] UPSERT — INSERT ... ON CONFLICT DO UPDATE/NOTHING (PG 9.5)
+- [x] UPSERT — INSERT ... ON CONFLICT DO UPDATE/NOTHING (PG 9.5)
 - [ ] MERGE (PG 15)
 - [ ] Multi-row VALUES (PG 8.2)
 - [ ] COPY TO/FROM with CSV (PG 8.0)

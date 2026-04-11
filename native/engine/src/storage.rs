@@ -360,6 +360,103 @@ pub fn insert_batch_checked(
     Ok(base_row_id)
 }
 
+/// Result of an upsert operation for a single row.
+pub enum UpsertAction {
+    Inserted,
+    Updated(usize),  // index of the conflicting row that was updated
+    Skipped,         // DO NOTHING
+}
+
+/// Insert rows with ON CONFLICT handling. For each row:
+/// - If no conflict: insert normally
+/// - If conflict + DO NOTHING: skip
+/// - If conflict + DO UPDATE: call updater on conflicting row
+/// Returns (inserted_count, updated_count, all affected rows for RETURNING).
+pub fn insert_upsert(
+    schema: &str,
+    name: &str,
+    rows: Vec<Row>,
+    unique_checks: &[(usize, String)],
+    pk_cols: &[usize],
+    do_update: bool,
+    mut updater: impl FnMut(&Row, &Row) -> Result<Row, String>, // (existing, excluded) -> new
+) -> Result<(u64, u64, Vec<Row>), String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+
+    let mut inserted: u64 = 0;
+    let mut updated: u64 = 0;
+    let mut affected_rows: Vec<Row> = Vec::new();
+
+    for row in rows {
+        // Check for conflict against existing data
+        let conflict_idx = find_conflict(&table, &row, unique_checks, pk_cols);
+
+        match conflict_idx {
+            None => {
+                // No conflict: insert
+                affected_rows.push(row.clone());
+                add_to_indexes(&mut table, &row);
+                table.rows.push(row);
+                inserted += 1;
+            }
+            Some(idx) if do_update => {
+                // Conflict + DO UPDATE
+                let existing = &table.rows[idx];
+                let new_row = updater(existing, &row)?;
+                affected_rows.push(new_row.clone());
+                table.rows[idx] = new_row;
+                updated += 1;
+            }
+            Some(_) => {
+                // Conflict + DO NOTHING
+            }
+        }
+    }
+
+    // Rebuild indexes after mutations
+    if updated > 0 {
+        rebuild_indexes(&mut table);
+    }
+
+    Ok((inserted, updated, affected_rows))
+}
+
+/// Find the index of a conflicting row, if any.
+fn find_conflict(
+    table: &TableStore,
+    row: &Row,
+    unique_checks: &[(usize, String)],
+    pk_cols: &[usize],
+) -> Option<usize> {
+    // Check composite PK
+    if pk_cols.len() > 1 {
+        let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
+        if let Some(ref pk_idx) = table.pk_index {
+            if pk_idx.contains(&key) {
+                // Find the actual row index
+                return table.rows.iter().position(|r| {
+                    pk_cols.iter().all(|&ci| r[ci] == row[ci])
+                });
+            }
+        }
+    }
+
+    // Check per-column unique constraints (including single-column PK)
+    for &(col_idx, _) in unique_checks {
+        if matches!(row[col_idx], Value::Null) {
+            continue;
+        }
+        if let Some(idx) = table.unique_indexes.get(&col_idx) {
+            if idx.contains(&row[col_idx]) {
+                return table.rows.iter().position(|r| r[col_idx] == row[col_idx]);
+            }
+        }
+    }
+
+    None
+}
+
 /// Update matching rows with validation. Returns error if any updater fails.
 /// Fixes: intra-batch uniqueness check (#3) and panic-safe atomic swap (#6).
 pub fn update_rows_checked(
