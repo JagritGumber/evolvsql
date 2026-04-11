@@ -874,7 +874,6 @@ fn exec_insert(
     // Atomic batch insert: validate ALL rows against existing data AND each other,
     // then insert all at once. If any row fails, nothing is committed. (#4)
     let (unique_checks, pk_cols) = build_unique_checks(&table_def);
-    let row_count = all_rows.len() as u64;
 
     // Auto-create HNSW index on first INSERT if table has a vector column
     let vector_col_idx = table_def
@@ -882,7 +881,6 @@ fn exec_insert(
         .iter()
         .position(|c| c.type_oid == crate::types::TypeOid::Vector);
     if let Some(col_idx) = vector_col_idx {
-        // Ensure index exists (no-op if already created)
         let _ = storage::ensure_hnsw_index(
             schema,
             table_name,
@@ -891,29 +889,63 @@ fn exec_insert(
         );
     }
 
-    let needs_row_copy = has_returning || vector_col_idx.is_some();
-    let inserted_rows = if needs_row_copy { all_rows.clone() } else { Vec::new() };
+    // ON CONFLICT handling (UPSERT)
+    if let Some(ref oc) = insert.on_conflict_clause {
+        let do_update = oc.action == pg_query::protobuf::OnConflictAction::OnconflictUpdate as i32;
+        let set_clauses: Vec<(usize, NodeEnum)> = if do_update {
+            parse_on_conflict_set(&oc.target_list, &table_def)?
+        } else {
+            Vec::new()
+        };
+        // Parse conflict target columns from InferClause
+        let conflict_cols: Vec<usize> = if let Some(ref infer) = oc.infer {
+            parse_conflict_columns(&infer.index_elems, &table_def)?
+        } else {
+            Vec::new() // empty = check all unique/PK constraints
+        };
+        let td_clone = table_def.clone();
 
-    let base_row_id = storage::insert_batch_checked(
-        schema, table_name, all_rows, &unique_checks, &pk_cols,
-    )?;
+        let (inserted, updated, affected_rows) = storage::insert_upsert(
+            schema, table_name, all_rows, &unique_checks, &pk_cols,
+            &conflict_cols, do_update,
+            |existing, excluded| {
+                apply_on_conflict_update(existing, excluded, &set_clauses, &td_clone)
+            },
+        )?;
 
-    // Insert vectors into HNSW index using the correct base_row_id from inside the write lock
-    if let Some(col_idx) = vector_col_idx {
-        if storage::has_hnsw_index(schema, table_name).is_some() {
-            for (i, row) in inserted_rows.iter().enumerate() {
-                if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
-                    let _ = storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone());
+        let total = inserted + updated;
+        let tag = format!("INSERT 0 {}", total);
+        if has_returning {
+            eval_returning(&insert.returning_list, &affected_rows, &table_def, schema, table_name, &tag)
+        } else {
+            Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+        }
+    } else {
+        // Standard INSERT (no ON CONFLICT)
+        let row_count = all_rows.len() as u64;
+        let needs_row_copy = has_returning || vector_col_idx.is_some();
+        let inserted_rows = if needs_row_copy { all_rows.clone() } else { Vec::new() };
+
+        let base_row_id = storage::insert_batch_checked(
+            schema, table_name, all_rows, &unique_checks, &pk_cols,
+        )?;
+
+        if let Some(col_idx) = vector_col_idx {
+            if storage::has_hnsw_index(schema, table_name).is_some() {
+                for (i, row) in inserted_rows.iter().enumerate() {
+                    if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
+                        let _ = storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone());
+                    }
                 }
             }
         }
-    }
 
-    let tag = format!("INSERT 0 {}", row_count);
-    if has_returning {
-        eval_returning(&insert.returning_list, &inserted_rows, &table_def, schema, table_name, &tag)
-    } else {
-        Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+        let tag = format!("INSERT 0 {}", row_count);
+        if has_returning {
+            eval_returning(&insert.returning_list, &inserted_rows, &table_def, schema, table_name, &tag)
+        } else {
+            Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+        }
     }
 }
 
@@ -970,6 +1002,103 @@ fn build_unique_checks(table: &Table) -> (Vec<(usize, String)>, Vec<usize>) {
     }
 
     (unique_checks, pk_cols)
+}
+
+/// Parse ON CONFLICT (col1, col2) conflict target into column indices.
+fn parse_conflict_columns(
+    index_elems: &[pg_query::protobuf::Node],
+    table: &Table,
+) -> Result<Vec<usize>, String> {
+    let mut cols = Vec::new();
+    for elem in index_elems {
+        if let Some(NodeEnum::IndexElem(ie)) = elem.node.as_ref() {
+            let col_idx = table.columns.iter()
+                .position(|c| c.name == ie.name)
+                .ok_or_else(|| format!("column \"{}\" does not exist", ie.name))?;
+            cols.push(col_idx);
+        }
+    }
+    Ok(cols)
+}
+
+/// Parse ON CONFLICT DO UPDATE SET clauses into (col_idx, expr) pairs.
+fn parse_on_conflict_set(
+    target_list: &[pg_query::protobuf::Node],
+    table: &Table,
+) -> Result<Vec<(usize, NodeEnum)>, String> {
+    let mut result = Vec::new();
+    for node in target_list {
+        if let Some(NodeEnum::ResTarget(rt)) = node.node.as_ref() {
+            let col_idx = table.columns.iter()
+                .position(|c| c.name == rt.name)
+                .ok_or_else(|| format!("column \"{}\" does not exist", rt.name))?;
+            let expr = rt.val.as_ref()
+                .and_then(|v| v.node.as_ref())
+                .ok_or("ON CONFLICT SET missing value expression")?
+                .clone();
+            result.push((col_idx, expr));
+        }
+    }
+    Ok(result)
+}
+
+/// Apply ON CONFLICT DO UPDATE SET assignments.
+/// Handles EXCLUDED pseudo-table references by substituting with the proposed row values.
+fn apply_on_conflict_update(
+    existing: &[Value],
+    excluded: &[Value],
+    set_clauses: &[(usize, NodeEnum)],
+    table: &Table,
+) -> Result<Vec<Value>, String> {
+    let mut new_row = existing.to_vec();
+    let ncols = table.columns.len();
+
+    // Build a combined row: [existing_cols..., excluded_cols...]
+    // so that column references to EXCLUDED.col resolve to offset ncols + col_idx
+    let mut combined: Vec<Value> = existing.to_vec();
+    combined.extend_from_slice(excluded);
+
+    // Build a JoinContext with two sources: the table and EXCLUDED
+    let table_cols: Vec<Column> = table.columns.clone();
+    let excluded_cols: Vec<Column> = table.columns.iter()
+        .map(|c| Column { name: c.name.clone(), ..c.clone() })
+        .collect();
+    let excluded_table = Table {
+        name: "excluded".into(),
+        schema: String::new(),
+        columns: excluded_cols,
+    };
+    let ctx = JoinContext {
+        sources: vec![
+            JoinSource {
+                alias: table.name.clone(),
+                table_name: table.name.clone(),
+                schema: table.schema.clone(),
+                table_def: Table { columns: table_cols, ..table.clone() },
+                col_offset: 0,
+            },
+            JoinSource {
+                alias: "excluded".into(),
+                table_name: "excluded".into(),
+                schema: String::new(),
+                table_def: excluded_table,
+                col_offset: ncols,
+            },
+        ],
+        total_columns: ncols * 2,
+    };
+
+    let mut arena = QueryArena::new();
+    let arena_row = crate::arena::rows_to_arena(&[combined], &mut arena);
+    let arena_combined = &arena_row[0];
+
+    for &(col_idx, ref expr) in set_clauses {
+        let val = eval_expr(expr, arena_combined, &ctx, &mut arena)?;
+        new_row[col_idx] = val.to_value(&arena);
+    }
+
+    check_not_null(table, &new_row)?;
+    Ok(new_row)
 }
 
 /// Validate uniqueness of `new_row` against `all_rows`, excluding row at `skip_idx`.
@@ -7300,6 +7429,135 @@ mod tests {
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("WITH RECURSIVE"));
+    }
+
+    // ---- UPSERT tests ----
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_do_nothing() {
+        setup();
+        execute("CREATE TABLE udn (id int PRIMARY KEY, name text)").unwrap();
+        execute("INSERT INTO udn VALUES (1, 'alice')").unwrap();
+        // Conflicting insert should be silently skipped
+        let r = execute("INSERT INTO udn VALUES (1, 'bob') ON CONFLICT DO NOTHING").unwrap();
+        assert_eq!(r.tag, "INSERT 0 0");
+        // Original row unchanged
+        let r = execute("SELECT * FROM udn").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_do_nothing_no_conflict() {
+        setup();
+        execute("CREATE TABLE udnn (id int PRIMARY KEY, name text)").unwrap();
+        execute("INSERT INTO udnn VALUES (1, 'alice')").unwrap();
+        // No conflict - should insert normally
+        let r = execute("INSERT INTO udnn VALUES (2, 'bob') ON CONFLICT DO NOTHING").unwrap();
+        assert_eq!(r.tag, "INSERT 0 1");
+        let r = execute("SELECT * FROM udnn ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_do_update() {
+        setup();
+        execute("CREATE TABLE udu (id int PRIMARY KEY, name text, val int)").unwrap();
+        execute("INSERT INTO udu VALUES (1, 'alice', 10)").unwrap();
+        let r = execute(
+            "INSERT INTO udu VALUES (1, 'bob', 20) \
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, val = EXCLUDED.val",
+        ).unwrap();
+        assert_eq!(r.tag, "INSERT 0 1");
+        let r = execute("SELECT * FROM udu").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Some("bob".into()));
+        assert_eq!(r.rows[0][2], Some("20".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_do_update_partial() {
+        setup();
+        execute("CREATE TABLE udup (id int PRIMARY KEY, name text, val int)").unwrap();
+        execute("INSERT INTO udup VALUES (1, 'alice', 10)").unwrap();
+        // Only update val, keep existing name
+        let r = execute(
+            "INSERT INTO udup VALUES (1, 'bob', 20) \
+             ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val",
+        ).unwrap();
+        assert_eq!(r.tag, "INSERT 0 1");
+        let r = execute("SELECT * FROM udup").unwrap();
+        assert_eq!(r.rows[0][1], Some("alice".into())); // unchanged
+        assert_eq!(r.rows[0][2], Some("20".into()));    // updated
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_do_update_expression() {
+        setup();
+        execute("CREATE TABLE udue (id int PRIMARY KEY, counter int)").unwrap();
+        execute("INSERT INTO udue VALUES (1, 10)").unwrap();
+        // Increment counter using existing value + excluded value
+        let r = execute(
+            "INSERT INTO udue VALUES (1, 5) \
+             ON CONFLICT (id) DO UPDATE SET counter = udue.counter + EXCLUDED.counter",
+        ).unwrap();
+        assert_eq!(r.tag, "INSERT 0 1");
+        let r = execute("SELECT * FROM udue").unwrap();
+        assert_eq!(r.rows[0][1], Some("15".into())); // 10 + 5
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_batch_mixed() {
+        setup();
+        execute("CREATE TABLE ubm (id int PRIMARY KEY, val int)").unwrap();
+        execute("INSERT INTO ubm VALUES (1, 10)").unwrap();
+        // Batch: id=1 conflicts (update), id=2 is new (insert)
+        let r = execute(
+            "INSERT INTO ubm VALUES (1, 100), (2, 200) \
+             ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val",
+        ).unwrap();
+        assert_eq!(r.tag, "INSERT 0 2");
+        let r = execute("SELECT * FROM ubm ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][1], Some("100".into())); // updated
+        assert_eq!(r.rows[1][1], Some("200".into())); // inserted
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_unique_constraint() {
+        setup();
+        execute("CREATE TABLE uuc (id int, email text UNIQUE, name text)").unwrap();
+        execute("INSERT INTO uuc VALUES (1, 'a@b.com', 'alice')").unwrap();
+        let r = execute(
+            "INSERT INTO uuc VALUES (2, 'a@b.com', 'bob') ON CONFLICT DO NOTHING",
+        ).unwrap();
+        assert_eq!(r.tag, "INSERT 0 0");
+        let r = execute("SELECT * FROM uuc").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][2], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upsert_returning() {
+        setup();
+        execute("CREATE TABLE ur (id int PRIMARY KEY, val int)").unwrap();
+        execute("INSERT INTO ur VALUES (1, 10)").unwrap();
+        let r = execute(
+            "INSERT INTO ur VALUES (1, 20) \
+             ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val \
+             RETURNING id, val",
+        ).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("20".into()));
     }
 
 }

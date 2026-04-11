@@ -105,6 +105,7 @@ Currently supported:
 - Set operations: UNION, UNION ALL, INTERSECT, EXCEPT
 - JOINs: INNER, LEFT, RIGHT, FULL, CROSS, implicit (hash join for equi, nested loop for theta)
 - Subqueries: IN, EXISTS, scalar, ALL, derived tables (correlated supported)
+- UPSERT: INSERT ... ON CONFLICT DO NOTHING / DO UPDATE SET (with EXCLUDED pseudo-table)
 - Expressions: arithmetic (+ - * / %), comparison, boolean logic, IS NULL, LIKE, ILIKE, CASE WHEN, COALESCE, NULLIF
 - Aggregates: COUNT, SUM, AVG, MIN, MAX, STRING_AGG, BOOL_AND, BOOL_OR (with DISTINCT support)
 - Window functions: ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, SUM/COUNT/AVG/MIN/MAX OVER
