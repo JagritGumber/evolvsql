@@ -39,7 +39,7 @@ pub(crate) fn resolve_sort_keys_with_exprs(
                 Some(NodeEnum::ColumnRef(cref)) => resolve_column(cref, ctx)?,
                 Some(NodeEnum::AConst(ac)) => {
                     let ordinal = match &ac.val { Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival as usize, _ => return Err("invalid ORDER BY ordinal".into()) };
-                    resolve_ordinal_to_col_idx(ordinal, select, ctx)?
+                    resolve_ordinal_or_expr(ordinal, select, ctx, &mut next_col, &mut expr_nodes, keys.len())?
                 }
                 Some(expr_node) => { let idx = next_col; next_col += 1; expr_nodes.push((keys.len(), expr_node)); idx }
                 None => return Err("ORDER BY missing expression".into()),
@@ -67,15 +67,29 @@ pub(crate) fn resolve_sort_keys_with_exprs(
     Ok((keys, expr_count))
 }
 
-fn resolve_ordinal_to_col_idx(ordinal: usize, select: &pg_query::protobuf::SelectStmt, ctx: &JoinContext) -> Result<usize, String> {
-    if ordinal == 0 || ordinal > select.target_list.len() { return Err(format!("ORDER BY position {} is not in select list", ordinal)); }
+/// Resolve ORDER BY ordinal. For ColumnRef targets, returns the column index.
+/// For expression targets, adds to expr_nodes and returns the temp column index.
+fn resolve_ordinal_or_expr<'a>(
+    ordinal: usize, select: &'a pg_query::protobuf::SelectStmt, ctx: &JoinContext,
+    next_col: &mut usize, expr_nodes: &mut Vec<(usize, &'a NodeEnum)>, key_idx: usize,
+) -> Result<usize, String> {
+    if ordinal == 0 || ordinal > select.target_list.len() {
+        return Err(format!("ORDER BY position {} is not in select list", ordinal));
+    }
     let target = &select.target_list[ordinal - 1];
     if let Some(NodeEnum::ResTarget(rt)) = target.node.as_ref() {
-        if let Some(NodeEnum::ColumnRef(cref)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-            return resolve_column(cref, ctx);
+        if let Some(node) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            if let NodeEnum::ColumnRef(cref) = node {
+                return resolve_column(cref, ctx);
+            }
+            // Expression target: route through expression evaluation path
+            let idx = *next_col;
+            *next_col += 1;
+            expr_nodes.push((key_idx, node));
+            return Ok(idx);
         }
     }
-    Err("ORDER BY ordinal must reference a column".into())
+    Err("ORDER BY ordinal must reference a column or expression".into())
 }
 
 /// Resolve ORDER BY keys for aggregate query results.

@@ -82,6 +82,10 @@ pub(crate) fn try_fast_equality_filter(
         if op != "=" { return None; }
         let left = expr.lexpr.as_ref()?.node.as_ref()?;
         let right = expr.rexpr.as_ref()?.node.as_ref()?;
+        // Bail on TypeCast to avoid type mismatch (e.g. WHERE id = '5'::int)
+        if matches!(left, NodeEnum::TypeCast(_)) || matches!(right, NodeEnum::TypeCast(_)) {
+            return None;
+        }
         if let NodeEnum::ColumnRef(cref) = left {
             let col_idx = resolve_column(cref, ctx).ok()?;
             let val = eval_const(Some(right));

@@ -28,13 +28,17 @@ pub(crate) fn exec_set_operation(
         }
         combined
     } else if set_op == pg_query::protobuf::SetOperation::SetopIntersect as i32 {
-        lrows.into_iter().filter(|lrow| {
+        let mut result: Vec<Vec<ArenaValue>> = lrows.into_iter().filter(|lrow| {
             rrows.iter().any(|rrow| lrow.len() == rrow.len() && lrow.iter().zip(rrow.iter()).all(|(a, b)| a.eq_with(b, arena)))
-        }).collect()
+        }).collect();
+        if !select.all { result = dedup_distinct(&[pg_query::protobuf::Node { node: None }], result, arena); }
+        result
     } else {
-        lrows.into_iter().filter(|lrow| {
+        let mut result: Vec<Vec<ArenaValue>> = lrows.into_iter().filter(|lrow| {
             !rrows.iter().any(|rrow| lrow.len() == rrow.len() && lrow.iter().zip(rrow.iter()).all(|(a, b)| a.eq_with(b, arena)))
-        }).collect()
+        }).collect();
+        if !select.all { result = dedup_distinct(&[pg_query::protobuf::Node { node: None }], result, arena); }
+        result
     };
 
     if !select.sort_clause.is_empty() || select.limit_count.is_some() || select.limit_offset.is_some() {
