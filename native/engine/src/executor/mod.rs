@@ -64,8 +64,10 @@ pub fn execute(sql: &str) -> Result<QueryResult, String> {
         if let Some(cached) = cache.get(sql) {
             cached.clone()
         } else {
+            drop(cache); // release lock before expensive parse
             let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
             let proto = parsed.protobuf;
+            let mut cache = PARSE_CACHE.lock();
             cache.put(sql.to_string(), proto.clone());
             proto
         }
