@@ -81,7 +81,12 @@ pub(crate) fn exec_select_aggregate(
                             let agg_val = compute_aggregate(&name, fc, group_rows, ctx, arena)?;
                             if !columns_built {
                                 let alias = if rt.name.is_empty() { name.clone() } else { rt.name.clone() };
-                                let oid = match name.as_str() { "count" => 20, "avg" => 701, "bool_and" | "bool_or" => 16, _ => 25 };
+                                let oid = match name.as_str() {
+                                    "count" => 20, "avg" => 701, "bool_and" | "bool_or" => 16,
+                                    "string_agg" => 25,
+                                    "sum" | "min" | "max" => infer_agg_oid(fc, ctx),
+                                    _ => 25,
+                                };
                                 result_columns.push((alias, oid));
                             }
                             result_row.push(agg_val.to_text(arena));
@@ -114,4 +119,16 @@ pub(crate) fn exec_select_aggregate(
         }
     }
     Ok(QueryResult { tag: format!("SELECT {}", result_rows.len()), columns: result_columns, rows: result_rows })
+}
+
+/// Infer OID for SUM/MIN/MAX from the first argument's column type.
+fn infer_agg_oid(fc: &pg_query::protobuf::FuncCall, ctx: &JoinContext) -> i32 {
+    fc.args.first()
+        .and_then(|a| a.node.as_ref())
+        .and_then(|node| match node {
+            NodeEnum::ColumnRef(cref) => resolve_column(cref, ctx).ok(),
+            _ => None,
+        })
+        .and_then(|idx| column_type_oid(idx, ctx).ok())
+        .unwrap_or(701) // default to float8, not text
 }

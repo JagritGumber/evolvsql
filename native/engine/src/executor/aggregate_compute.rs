@@ -88,9 +88,13 @@ fn compute_min_max(fc: &pg_query::protobuf::FuncCall, rows: &[Vec<ArenaValue>], 
 
 fn compute_string_agg(fc: &pg_query::protobuf::FuncCall, rows: &[Vec<ArenaValue>], ctx: &JoinContext, arena: &mut QueryArena) -> Result<ArenaValue, String> {
     let arg = fc.args.first().and_then(|a| a.node.as_ref()).ok_or("STRING_AGG requires argument")?;
-    let delim = fc.args.get(1).and_then(|a| a.node.as_ref())
-        .map(|d| eval_expr(d, &rows[0], ctx, arena).ok().and_then(|v| v.to_text(arena)).unwrap_or_else(|| ", ".to_string()))
-        .unwrap_or_else(|| ", ".to_string());
+    let delim = if rows.is_empty() {
+        ", ".to_string()
+    } else {
+        fc.args.get(1).and_then(|a| a.node.as_ref())
+            .map(|d| eval_expr(d, &rows[0], ctx, arena).ok().and_then(|v| v.to_text(arena)).unwrap_or_else(|| ", ".to_string()))
+            .unwrap_or_else(|| ", ".to_string())
+    };
     let mut parts: Vec<String> = Vec::new();
     for row in rows { let v = eval_expr(arg, row, ctx, arena)?; if let Some(text) = v.to_text(arena) { parts.push(text); } }
     if parts.is_empty() { Ok(ArenaValue::Null) } else {

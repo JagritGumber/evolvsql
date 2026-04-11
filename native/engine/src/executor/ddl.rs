@@ -25,6 +25,7 @@ pub(crate) fn exec_create_table(create: &pg_query::protobuf::CreateStmt) -> Resu
     parse_table_constraints(&create.table_elts, &mut columns);
     let table = Table { name: table_name.clone(), schema: schema.to_string(), columns };
     if create.if_not_exists && catalog::get_table(schema, table_name).is_some() {
+        for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
         return Ok(QueryResult { tag: "CREATE TABLE".into(), columns: vec![], rows: vec![] });
     }
     catalog::create_table(table.clone())?;

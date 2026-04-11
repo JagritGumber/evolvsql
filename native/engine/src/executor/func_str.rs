@@ -63,16 +63,21 @@ pub(crate) fn eval_string_func(name: &str, args: &[ArenaValue], arena: &mut Quer
             if args.len() != 2 { return Err("left() requires 2 arguments".into()); }
             if args[0].is_null() { return Ok(ArenaValue::Null); }
             let s = args[0].to_text(arena).unwrap_or_default();
-            let n = match &args[1] { ArenaValue::Int(i) => *i as usize, _ => return Err("left() requires integer second argument".into()) };
-            Ok(ArenaValue::Text(arena.alloc_str(&s.chars().take(n).collect::<String>())))
+            let n = match &args[1] { ArenaValue::Int(i) => *i, _ => return Err("left() requires integer second argument".into()) };
+            let chars: Vec<char> = s.chars().collect();
+            // PostgreSQL: negative n means all but last |n| chars
+            let take_n = if n >= 0 { n as usize } else { chars.len().saturating_sub((-n) as usize) };
+            Ok(ArenaValue::Text(arena.alloc_str(&chars.iter().take(take_n).collect::<String>())))
         }
         "right" => {
             if args.len() != 2 { return Err("right() requires 2 arguments".into()); }
             if args[0].is_null() { return Ok(ArenaValue::Null); }
             let s = args[0].to_text(arena).unwrap_or_default();
-            let n = match &args[1] { ArenaValue::Int(i) => *i as usize, _ => return Err("right() requires integer second argument".into()) };
+            let n = match &args[1] { ArenaValue::Int(i) => *i, _ => return Err("right() requires integer second argument".into()) };
             let chars: Vec<char> = s.chars().collect();
-            let start = chars.len().saturating_sub(n);
+            // PostgreSQL: negative n means all but first |n| chars
+            let start = if n >= 0 { chars.len().saturating_sub(n as usize) } else { (-n) as usize };
+            let start = start.min(chars.len());
             Ok(ArenaValue::Text(arena.alloc_str(&chars[start..].iter().collect::<String>())))
         }
         _ => Err(format!("unknown string function: {}", name)),

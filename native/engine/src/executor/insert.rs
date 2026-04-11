@@ -49,7 +49,9 @@ pub(crate) fn exec_insert(insert: &pg_query::protobuf::InsertStmt) -> Result<Que
             let mut arena = QueryArena::new();
             let (_cols, raw_rows) = exec_select_raw(sel, None, &mut arena)?;
             for raw_row in &raw_rows {
-                let mut row: Vec<Value> = table_def.columns.iter().map(|_| Value::Null).collect();
+                let mut row: Vec<Value> = table_def.columns.iter().map(|col| {
+                    if target_cols.contains(&col.name) { Ok(Value::Null) } else { apply_default(&col.default_expr, schema) }
+                }).collect::<Result<Vec<_>, _>>()?;
                 for (i, val) in raw_row.iter().enumerate() {
                     if i >= target_cols.len() { break; }
                     let col_idx = table_def.columns.iter().position(|c| c.name == target_cols[i]).ok_or_else(|| format!("column \"{}\" does not exist", target_cols[i]))?;
