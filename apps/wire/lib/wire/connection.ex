@@ -14,13 +14,7 @@ defmodule Wire.Connection do
   end
 
   def start(socket) do
-    pid = :erlang.spawn_opt(fn ->
-      try do
-        handshake(socket)
-      after
-        Wire.ConnCounter.release()
-      end
-    end, [
+    pid = :erlang.spawn_opt(fn -> handshake(socket) end, [
       :link,
       {:min_heap_size, 233},
       {:min_bin_vheap_size, 46},

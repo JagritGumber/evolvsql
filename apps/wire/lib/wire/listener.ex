@@ -42,6 +42,9 @@ defmodule Wire.Listener do
         case Wire.ConnCounter.try_acquire() do
           :ok ->
             {:ok, pid} = Wire.Connection.start(client)
+            # Monitor the connection so we release the counter on ANY exit path
+            # (including hibernate, which destroys the call stack and any try/after).
+            Process.monitor(pid)
             :gen_tcp.controlling_process(client, pid)
 
           {:error, :too_many_connections} ->
@@ -56,6 +59,12 @@ defmodule Wire.Listener do
     end
 
     send(self(), :accept)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state) do
+    Wire.ConnCounter.release()
     {:noreply, state}
   end
 
