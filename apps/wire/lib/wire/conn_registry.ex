@@ -21,10 +21,14 @@ defmodule Wire.ConnRegistry do
 
   @impl true
   def init(_) do
-    # Initialize counter here so it exists before the listener starts.
-    # init is idempotent, so a supervisor restart of registry alone won't
-    # reset the counter.
+    # Ensure the counter ref exists (idempotent).
     Wire.ConnCounter.init()
+    # Reset the counter on every registry start: our monitor state is
+    # empty, so the counter must start at 0 to match. Under :rest_for_one
+    # supervision, a registry crash also restarts the listener, so all
+    # tracking restarts cleanly together. Orphan connections from before
+    # the crash are unmonitored but the counter won't over-count them.
+    Wire.ConnCounter.reset()
     # Map monitor refs to pids (unused value, kept for potential future lookups)
     {:ok, %{}}
   end

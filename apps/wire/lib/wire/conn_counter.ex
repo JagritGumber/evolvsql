@@ -7,9 +7,9 @@ defmodule Wire.ConnCounter do
   @default_max 100
 
   def init do
-    # Idempotent: only create the atomic ref if one doesn't exist yet.
-    # Protects against listener restarts resetting the counter while
-    # existing connections remain alive but untracked.
+    # Idempotent ref creation: only create the atomic ref if one doesn't
+    # exist yet. Preserves the ref across supervisor restarts so callers
+    # don't race on a nil lookup.
     case :persistent_term.get({__MODULE__, :ref}, nil) do
       nil ->
         ref = :atomics.new(1, signed: true)
@@ -19,6 +19,18 @@ defmodule Wire.ConnCounter do
       _existing ->
         :ok
     end
+  end
+
+  @doc """
+  Reset the counter to zero. Called by Wire.ConnRegistry on (re)start
+  because the registry's monitor state is fresh after any crash, so
+  the counter must be reset to match. Accepts a brief window where
+  existing orphan connections are over-limit until they terminate.
+  """
+  def reset do
+    ref = :persistent_term.get({__MODULE__, :ref})
+    :atomics.put(ref, 1, 0)
+    :ok
   end
 
   def try_acquire do
