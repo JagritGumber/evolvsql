@@ -2,6 +2,7 @@ mod arena;
 mod catalog;
 mod executor;
 mod hnsw;
+mod memtable;
 mod parser;
 mod segment;
 mod sequence;
