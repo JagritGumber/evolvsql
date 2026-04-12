@@ -6,6 +6,8 @@ use crate::types::Value;
 mod basic;
 mod corruption;
 mod payload;
+mod manager_tests;
+mod storage_integration;
 
 pub(super) fn tmp_wal_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

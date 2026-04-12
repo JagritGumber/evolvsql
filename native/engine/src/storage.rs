@@ -352,6 +352,13 @@ pub fn insert_batch_checked(
         }
     }
 
+    // WAL durability: append each row to the log and fsync before
+    // committing to the in-memory store. No-op when WAL is disabled.
+    // This happens AFTER validation so we never log a row we'll reject.
+    for row in rows.iter() {
+        crate::wal::manager::append_insert(schema, name, row)?;
+    }
+
     // All validated - push all atomically and update indexes
     let base_row_id = table.rows.len();
     for (i, row) in rows.into_iter().enumerate() {
