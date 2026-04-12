@@ -14,8 +14,10 @@ defmodule Wire.Connection do
   end
 
   def start(socket) do
+    # No :link - the listener uses Process.monitor to track connection lifecycle.
+    # A link would propagate connection crashes to the listener, resetting the
+    # counter on restart and breaking the connection limit guarantee.
     pid = :erlang.spawn_opt(fn -> handshake(socket) end, [
-      :link,
       {:min_heap_size, 233},
       {:min_bin_vheap_size, 46},
       {:fullsweep_after, 10}

@@ -18,8 +18,6 @@ defmodule Wire.Listener do
       nodelay: true,
       backlog: 128,
       buffer: 8192
-      # sndbuf/recbuf omitted — let kernel auto-tune
-      # PG wire protocol messages are typically < 8KB
     ]
 
     case :gen_tcp.listen(port, tcp_opts) do
@@ -37,8 +35,19 @@ defmodule Wire.Listener do
   def handle_info(:accept, %{socket: socket} = state) do
     case :gen_tcp.accept(socket, 1000) do
       {:ok, client} ->
-        {:ok, pid} = Wire.Connection.start(client)
-        :gen_tcp.controlling_process(client, pid)
+        case Wire.ConnCounter.try_acquire() do
+          :ok ->
+            {:ok, pid} = Wire.Connection.start(client)
+            # Registry owns the monitor independently of the listener, so
+            # listener crashes don't leak counter slots.
+            Wire.ConnRegistry.track(pid)
+            :gen_tcp.controlling_process(client, pid)
+
+          {:error, :too_many_connections} ->
+            # Spawn async to avoid blocking the accept loop with recv/send I/O.
+            pid = spawn(Wire.Rejector, :reject, [client])
+            :gen_tcp.controlling_process(client, pid)
+        end
 
       {:error, :timeout} ->
         :ok
