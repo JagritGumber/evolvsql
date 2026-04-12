@@ -20,6 +20,7 @@ mod entry;
 mod writer;
 mod reader;
 pub mod manager;
+pub mod recovery;
 
 #[cfg(test)]
 mod tests;
