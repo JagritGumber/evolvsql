@@ -98,7 +98,7 @@ For 1M-row tables this is going to be expensive. For 1K-row tables it's free. Th
 
 While planning the "implement hash join for equi-joins" PR, we discovered `try_equi_hash_join` already existed in `executor.rs`. It had been written but never wired into the general join path - only the specific RangeVar path used it. The 7,500-line monolithic file made this invisible. Splitting into 36 modules surfaced the function immediately.
 
-Architectural lesson: code you can't see doesn't exist. Splitting executor.rs revealed `~1,400 lines of duplication that we eliminated for free during the refactor. The split wasn't a refactor, it was an accidental code review.
+Architectural lesson: code you can't see doesn't exist. Splitting executor.rs revealed ~1,400 lines of duplication that we eliminated for free during the refactor. The split wasn't a refactor, it was an accidental code review.
 
 ### Window functions slot between WHERE and projection
 
