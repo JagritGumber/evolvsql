@@ -69,7 +69,11 @@ defmodule Wire.Listener do
   end
 
   defp reject_connection(client) do
-    # Send PG error response: too many connections
+    # Read and discard the startup message first so the client is in a state
+    # where it expects to receive server messages. Skipping this can cause
+    # the client to see a connection-reset instead of our FATAL error.
+    drain_startup(client)
+
     msg =
       <<"S", "FATAL", 0, "C", "53300", 0, "M",
         "too many connections", 0, 0>>
@@ -77,5 +81,22 @@ defmodule Wire.Listener do
     :gen_tcp.send(client, <<"E", byte_size(msg) + 4::32, msg::binary>>)
     :gen_tcp.close(client)
     Logger.warning("Rejected connection: limit reached")
+  end
+
+  defp drain_startup(client) do
+    with {:ok, <<len::32>>} <- :gen_tcp.recv(client, 4, 5_000),
+         {:ok, payload} <- :gen_tcp.recv(client, len - 4, 5_000) do
+      case payload do
+        # SSL request: respond N (no SSL), then read the actual startup
+        <<80_877_103::32>> ->
+          :gen_tcp.send(client, "N")
+          drain_startup(client)
+
+        _ ->
+          :ok
+      end
+    else
+      _ -> :ok
+    end
   end
 end

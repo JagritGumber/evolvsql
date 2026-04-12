@@ -7,9 +7,18 @@ defmodule Wire.ConnCounter do
   @default_max 100
 
   def init do
-    ref = :atomics.new(1, signed: true)
-    :persistent_term.put({__MODULE__, :ref}, ref)
-    :persistent_term.put({__MODULE__, :max}, max_connections())
+    # Idempotent: only create the atomic ref if one doesn't exist yet.
+    # Protects against listener restarts resetting the counter while
+    # existing connections remain alive but untracked.
+    case :persistent_term.get({__MODULE__, :ref}, nil) do
+      nil ->
+        ref = :atomics.new(1, signed: true)
+        :persistent_term.put({__MODULE__, :ref}, ref)
+        :persistent_term.put({__MODULE__, :max}, max_connections())
+
+      _existing ->
+        :ok
+    end
   end
 
   def try_acquire do
