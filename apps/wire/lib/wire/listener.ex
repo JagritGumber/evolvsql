@@ -18,11 +18,7 @@ defmodule Wire.Listener do
       nodelay: true,
       backlog: 128,
       buffer: 8192
-      # sndbuf/recbuf omitted — let kernel auto-tune
-      # PG wire protocol messages are typically < 8KB
     ]
-
-    Wire.ConnCounter.init()
 
     case :gen_tcp.listen(port, tcp_opts) do
       {:ok, socket} ->
@@ -42,13 +38,15 @@ defmodule Wire.Listener do
         case Wire.ConnCounter.try_acquire() do
           :ok ->
             {:ok, pid} = Wire.Connection.start(client)
-            # Monitor the connection so we release the counter on ANY exit path
-            # (including hibernate, which destroys the call stack and any try/after).
-            Process.monitor(pid)
+            # Registry owns the monitor independently of the listener, so
+            # listener crashes don't leak counter slots.
+            Wire.ConnRegistry.track(pid)
             :gen_tcp.controlling_process(client, pid)
 
           {:error, :too_many_connections} ->
-            reject_connection(client)
+            # Spawn async to avoid blocking the accept loop with recv/send I/O.
+            pid = spawn(Wire.Rejector, :reject, [client])
+            :gen_tcp.controlling_process(client, pid)
         end
 
       {:error, :timeout} ->
@@ -60,43 +58,5 @@ defmodule Wire.Listener do
 
     send(self(), :accept)
     {:noreply, state}
-  end
-
-  @impl true
-  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state) do
-    Wire.ConnCounter.release()
-    {:noreply, state}
-  end
-
-  defp reject_connection(client) do
-    # Read and discard the startup message first so the client is in a state
-    # where it expects to receive server messages. Skipping this can cause
-    # the client to see a connection-reset instead of our FATAL error.
-    drain_startup(client)
-
-    msg =
-      <<"S", "FATAL", 0, "C", "53300", 0, "M",
-        "too many connections", 0, 0>>
-
-    :gen_tcp.send(client, <<"E", byte_size(msg) + 4::32, msg::binary>>)
-    :gen_tcp.close(client)
-    Logger.warning("Rejected connection: limit reached")
-  end
-
-  defp drain_startup(client) do
-    with {:ok, <<len::32>>} <- :gen_tcp.recv(client, 4, 5_000),
-         {:ok, payload} <- :gen_tcp.recv(client, len - 4, 5_000) do
-      case payload do
-        # SSL request: respond N (no SSL), then read the actual startup
-        <<80_877_103::32>> ->
-          :gen_tcp.send(client, "N")
-          drain_startup(client)
-
-        _ ->
-          :ok
-      end
-    else
-      _ -> :ok
-    end
   end
 end
