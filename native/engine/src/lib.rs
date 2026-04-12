@@ -3,6 +3,7 @@ mod catalog;
 mod executor;
 mod hnsw;
 mod parser;
+mod segment;
 mod sequence;
 mod storage;
 mod types;
