@@ -57,3 +57,4 @@ mod cte;
 mod cte_ext;
 mod upsert;
 mod upsert_ext;
+mod devin_regressions;
