@@ -39,7 +39,7 @@ pub(super) fn recreate_for_table(table: &Table) {
 /// scan storage for the max int value and setval the sequence so the
 /// next nextval produces a non-colliding id.
 pub(super) fn advance_all_to_max() {
-    for table in catalog::list_tables("public") {
+    for table in catalog::list_all_tables() {
         for (col_idx, col) in table.columns.iter().enumerate() {
             let Some(DefaultExpr::NextVal(fqn)) = &col.default_expr else { continue; };
             let Some((seq_schema, seq_name)) = split_seq_fqn(fqn) else { continue; };
