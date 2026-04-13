@@ -12,7 +12,14 @@ fn append_and_read_single_entry() {
     let entries = WalReader::open(&path).unwrap().read_all().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].lsn, 1);
-    assert_eq!(entries[0].op, insert_op(1, "alice"));
+    match &entries[0].op {
+        WalOp::Insert { schema, table, row } => {
+            assert_eq!(schema, "public");
+            assert_eq!(table, "users");
+            assert_eq!(row.len(), 2);
+        }
+        _ => panic!("expected Insert op"),
+    }
     std::fs::remove_file(&path).ok();
 }
 

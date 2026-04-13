@@ -31,6 +31,8 @@ pub(crate) fn exec_create_table(create: &pg_query::protobuf::CreateStmt) -> Resu
     catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
     setup_indexes(&table, schema, table_name)?;
+    // WAL: log DDL so recovery can rebuild the schema without re-parsing SQL
+    crate::wal::manager::append_create_table(&table)?;
     Ok(QueryResult { tag: "CREATE TABLE".into(), columns: vec![], rows: vec![] })
 }
 
