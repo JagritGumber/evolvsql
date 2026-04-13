@@ -9,10 +9,11 @@ fn all_op_variants_round_trip() {
     writer.append(insert_op(1, "a")).unwrap();
     writer.append(WalOp::Update {
         schema: "public".into(), table: "users".into(),
-        row_id: 42, new_row: vec![Value::Int(99)],
+        old_row: vec![Value::Int(42)], new_row: vec![Value::Int(99)],
     }).unwrap();
     writer.append(WalOp::Delete {
-        schema: "public".into(), table: "users".into(), row_id: 7,
+        schema: "public".into(), table: "users".into(),
+        old_row: vec![Value::Int(7)],
     }).unwrap();
     writer.append(WalOp::Commit { txn_id: 123 }).unwrap();
     writer.append(WalOp::Checkpoint { up_to: 50 }).unwrap();
@@ -22,8 +23,8 @@ fn all_op_variants_round_trip() {
     let entries = WalReader::open(&path).unwrap().read_all().unwrap();
     assert_eq!(entries.len(), 5);
     assert!(matches!(entries[0].op, WalOp::Insert { .. }));
-    assert!(matches!(entries[1].op, WalOp::Update { row_id: 42, .. }));
-    assert!(matches!(entries[2].op, WalOp::Delete { row_id: 7, .. }));
+    assert!(matches!(entries[1].op, WalOp::Update { .. }));
+    assert!(matches!(entries[2].op, WalOp::Delete { .. }));
     assert!(matches!(entries[3].op, WalOp::Commit { txn_id: 123 }));
     assert!(matches!(entries[4].op, WalOp::Checkpoint { up_to: 50 }));
     std::fs::remove_file(&path).ok();

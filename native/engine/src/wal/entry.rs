@@ -12,14 +12,20 @@ pub struct WalEntry {
 
 /// The operation recorded by a WAL entry.
 ///
-/// Insert/Update/Delete target (schema, table). Commit and Checkpoint
-/// are control records. Recovery replays operations in LSN order into
-/// the memtable.
+/// Mutations record the full OLD and NEW row values rather than a
+/// physical row index. This makes recovery robust to storage layout
+/// changes: replay finds rows by content match, not by offset. It also
+/// avoids tying the WAL format to a specific storage data structure.
+///
+/// Duplicate-row ambiguity: if multiple rows have identical values,
+/// UPDATE/DELETE will affect the first match. This matches PostgreSQL's
+/// semantics for tables without a unique key (the "any matching row"
+/// contract).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WalOp {
     Insert { schema: String, table: String, row: Vec<Value> },
-    Update { schema: String, table: String, row_id: u64, new_row: Vec<Value> },
-    Delete { schema: String, table: String, row_id: u64 },
+    Update { schema: String, table: String, old_row: Vec<Value>, new_row: Vec<Value> },
+    Delete { schema: String, table: String, old_row: Vec<Value> },
     /// Marks a transaction boundary for group commit.
     Commit { txn_id: u64 },
     /// Marks the LSN up to which a memtable flush has persisted data.
