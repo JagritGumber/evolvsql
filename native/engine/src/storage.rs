@@ -138,8 +138,24 @@ pub fn delete_where(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
     let before = table.rows.len();
-    table.rows.retain_mut(|row| !predicate(row));
-    let deleted = before - table.rows.len();
+    // Collect deleted rows first so we can log them to WAL before
+    // committing the deletion. If WAL fsync fails, we abort without
+    // mutating storage.
+    let mut deleted_rows: Vec<Row> = Vec::new();
+    table.rows.retain_mut(|row| {
+        if predicate(row) {
+            deleted_rows.push(row.clone());
+            false
+        } else {
+            true
+        }
+    });
+    // WAL: append deletes before releasing the lock so recovery can
+    // reconstruct the exact mutation sequence.
+    for row in &deleted_rows {
+        crate::wal::manager::append_delete(schema, name, row)?;
+    }
+    let deleted = deleted_rows.len();
     if deleted > 0 {
         rebuild_indexes(&mut table);
     }
@@ -164,6 +180,10 @@ pub fn delete_where_returning(
             true
         }
     });
+    // WAL: log deletes for durability
+    for row in &deleted {
+        crate::wal::manager::append_delete(schema, name, row)?;
+    }
     if !deleted.is_empty() {
         rebuild_indexes(&mut table);
     }
@@ -680,6 +700,15 @@ pub fn update_rows_checked(
                 validator(row_a, &[row_b.clone()], usize::MAX)?;
             }
         }
+    }
+
+    // WAL: log all updates BEFORE the atomic swap. Recovery will
+    // replay them by matching old_row content against the in-memory
+    // state (which starts from the same initial state on a clean
+    // restart).
+    for (idx, new_row) in &updates {
+        let old_row = &table.rows[*idx];
+        crate::wal::manager::append_update(schema, name, old_row, new_row)?;
     }
 
     // Second pass: atomic swap — build new rows vec, then replace all at once (#6)
