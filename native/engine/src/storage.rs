@@ -123,6 +123,14 @@ where
 pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
+    // Log every row as a Delete before clearing so recovery sees the
+    // same state transition. This is the TRUNCATE / DELETE-no-WHERE
+    // path; logging row-by-row keeps the replay logic uniform with
+    // delete_where. A dedicated Truncate op would be a future
+    // optimization once log volume becomes a concern.
+    for row in table.rows.iter() {
+        crate::wal::manager::append_delete(schema, name, row)?;
+    }
     let count = table.rows.len() as u64;
     table.rows.clear();
     for idx in table.unique_indexes.values_mut() {
@@ -749,6 +757,9 @@ pub fn update_rows_checked(
 pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
+    for row in table.rows.iter() {
+        crate::wal::manager::append_delete(schema, name, row)?;
+    }
     for idx in table.unique_indexes.values_mut() {
         idx.clear();
     }

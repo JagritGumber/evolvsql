@@ -92,9 +92,20 @@ pub(crate) fn exec_create_table_as(ctas: &pg_query::protobuf::CreateTableAsStmt)
     let (columns, raw_rows) = exec_select_raw(sel, None, &mut arena)?;
     let table_columns: Vec<Column> = columns.iter().map(|(name, oid)| Column { name: name.clone(), type_oid: TypeOid::from_oid(*oid), nullable: true, primary_key: false, unique: false, default_expr: None }).collect();
     let table = crate::catalog::Table { name: table_name.clone(), schema: schema.to_string(), columns: table_columns };
-    catalog::create_table(table)?;
+    catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
+    // WAL: log the table creation so recovery can recreate the schema
+    // before replaying its rows. Has to happen after catalog::create_table
+    // succeeds (so we don't log a table the catalog rejected) and before
+    // the row inserts (so the replay order matches: create then insert).
+    crate::wal::manager::append_create_table(&table)?;
     let rows: Vec<Vec<crate::types::Value>> = raw_rows.iter().map(|row| row.iter().map(|v| v.to_value(&arena)).collect()).collect();
-    if !rows.is_empty() { storage::insert_batch(schema, table_name, rows); }
+    if !rows.is_empty() {
+        // insert_batch_checked logs each row to the WAL and runs
+        // constraint checks. CTAS targets have no constraints, so
+        // unique_checks and pk_cols are empty — but we still go
+        // through this path for WAL durability.
+        storage::insert_batch_checked(schema, table_name, rows, &[], &[])?;
+    }
     Ok(QueryResult { tag: format!("SELECT {}", raw_rows.len()), columns: vec![], rows: vec![] })
 }
