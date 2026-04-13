@@ -30,7 +30,7 @@ pub(crate) fn exec_create_table(create: &pg_query::protobuf::CreateStmt) -> Resu
     }
     catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
-    setup_indexes(&table, schema, table_name)?;
+    storage::setup_table_indexes(&table)?;
     // WAL: log DDL so recovery can rebuild the schema without re-parsing SQL
     crate::wal::manager::append_create_table(&table)?;
     Ok(QueryResult { tag: "CREATE TABLE".into(), columns: vec![], rows: vec![] })
@@ -87,16 +87,6 @@ fn parse_table_constraints(table_elts: &[pg_query::protobuf::Node], columns: &mu
             }
         }
     }
-}
-
-fn setup_indexes(table: &Table, schema: &str, table_name: &str) -> Result<(), String> {
-    let pk_cols: Vec<usize> = table.columns.iter().enumerate().filter(|(_, c)| c.primary_key).map(|(i, _)| i).collect();
-    for (i, col) in table.columns.iter().enumerate() {
-        if col.primary_key && pk_cols.len() == 1 { storage::add_unique_index(schema, table_name, i)?; }
-        else if col.unique { storage::add_unique_index(schema, table_name, i)?; }
-    }
-    if pk_cols.len() > 1 { storage::add_pk_index(schema, table_name, &pk_cols)?; }
-    Ok(())
 }
 
 /// Extract type name from ColumnDef.

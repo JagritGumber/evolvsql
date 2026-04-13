@@ -86,6 +86,35 @@ pub fn add_pk_index(schema: &str, name: &str, pk_cols: &[usize]) -> Result<(), S
     Ok(())
 }
 
+/// Build all indexes for a freshly-created table from its catalog entry.
+/// Single-column PK or UNIQUE columns get per-column hash indexes;
+/// composite PK (>1 column) gets a pk_index on the tuple and NO
+/// per-column unique indexes (those would over-constrain inserts that
+/// legitimately share a value in one PK column). Used by both the live
+/// CREATE TABLE path and WAL recovery replay so they stay in sync.
+///
+/// Note: parse_table_constraints sets col.unique = true for every
+/// PRIMARY KEY column (including composite ones). The explicit
+/// `is_composite_pk_col` skip below is load-bearing: without it the
+/// `col.unique` branch would fire for each column of a composite PK
+/// and silently create per-column indexes that waste memory and are
+/// maintained on every write.
+pub fn setup_table_indexes(table: &crate::catalog::Table) -> Result<(), String> {
+    let pk_cols: Vec<usize> = table.columns.iter().enumerate()
+        .filter(|(_, c)| c.primary_key).map(|(i, _)| i).collect();
+    let is_composite = pk_cols.len() > 1;
+    for (i, col) in table.columns.iter().enumerate() {
+        if col.primary_key && is_composite { continue; }
+        if col.primary_key || col.unique {
+            add_unique_index(&table.schema, &table.name, i)?;
+        }
+    }
+    if is_composite {
+        add_pk_index(&table.schema, &table.name, &pk_cols)?;
+    }
+    Ok(())
+}
+
 pub fn drop_table(schema: &str, name: &str) {
     let mut store = STORE.write();
     store.remove(&key(schema, name));

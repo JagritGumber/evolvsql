@@ -33,11 +33,7 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
                 if catalog::get_table(&table.schema, &table.name).is_some() { continue; }
                 catalog::create_table(table.clone())?;
                 storage::create_table(&table.schema, &table.name);
-                for (i, col) in table.columns.iter().enumerate() {
-                    if col.primary_key || col.unique {
-                        let _ = storage::add_unique_index(&table.schema, &table.name, i);
-                    }
-                }
+                storage::setup_table_indexes(table)?;
                 sequences::recreate_for_table(table);
                 applied += 1;
             }
