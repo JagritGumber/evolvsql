@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::Table;
+use crate::catalog::{Column, Table};
 use crate::types::Value;
 use super::Lsn;
 
@@ -31,6 +31,17 @@ pub enum WalOp {
     CreateTable { table: Table },
     /// Drop a table by fully qualified name.
     DropTable { schema: String, table: String },
+    /// ALTER TABLE ADD COLUMN. fill_value is the resolved default used
+    /// to backfill existing rows; logging it avoids re-evaluating
+    /// non-deterministic defaults during replay.
+    AlterAddColumn { schema: String, table: String, column: Column, fill_value: Value },
+    /// ALTER TABLE DROP COLUMN, keyed by column name so replay is
+    /// robust to position shifts from prior DROPs.
+    AlterDropColumn { schema: String, table: String, column: String },
+    /// ALTER TABLE RENAME TO.
+    RenameTable { schema: String, old_name: String, new_name: String },
+    /// ALTER TABLE RENAME COLUMN.
+    RenameColumn { schema: String, table: String, old_column: String, new_column: String },
     /// Marks a transaction boundary for group commit.
     Commit { txn_id: u64 },
     /// Marks the LSN up to which a memtable flush has persisted data.
@@ -46,6 +57,10 @@ pub(super) const OP_COMMIT: u8 = 4;
 pub(super) const OP_CHECKPOINT: u8 = 5;
 pub(super) const OP_CREATE_TABLE: u8 = 6;
 pub(super) const OP_DROP_TABLE: u8 = 7;
+pub(super) const OP_ALTER_ADD_COL: u8 = 8;
+pub(super) const OP_ALTER_DROP_COL: u8 = 9;
+pub(super) const OP_RENAME_TABLE: u8 = 10;
+pub(super) const OP_RENAME_COL: u8 = 11;
 
 impl WalOp {
     pub(super) fn tag(&self) -> u8 {
@@ -57,6 +72,10 @@ impl WalOp {
             WalOp::Checkpoint { .. } => OP_CHECKPOINT,
             WalOp::CreateTable { .. } => OP_CREATE_TABLE,
             WalOp::DropTable { .. } => OP_DROP_TABLE,
+            WalOp::AlterAddColumn { .. } => OP_ALTER_ADD_COL,
+            WalOp::AlterDropColumn { .. } => OP_ALTER_DROP_COL,
+            WalOp::RenameTable { .. } => OP_RENAME_TABLE,
+            WalOp::RenameColumn { .. } => OP_RENAME_COL,
         }
     }
 

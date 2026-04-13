@@ -4,6 +4,8 @@ use crate::types::Value;
 
 use super::super::{WalEntry, WalOp};
 
+mod alter;
+
 /// Apply a list of entries to storage. Insert uses the unchecked path
 /// since constraints were already validated when logged. Update and
 /// Delete match rows by content (robust to storage layout changes).
@@ -27,12 +29,9 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
                 applied += 1;
             }
             WalOp::CreateTable { table } => {
-                // Idempotent: skip if table already exists in this
-                // session (e.g., partial replay or double-recover).
                 if catalog::get_table(&table.schema, &table.name).is_some() { continue; }
                 catalog::create_table(table.clone())?;
                 storage::create_table(&table.schema, &table.name);
-                // Re-build indexes for any columns with PK/UNIQUE constraints
                 for (i, col) in table.columns.iter().enumerate() {
                     if col.primary_key || col.unique {
                         let _ = storage::add_unique_index(&table.schema, &table.name, i);
@@ -46,6 +45,12 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
                     storage::drop_table(schema, table);
                 }
                 applied += 1;
+            }
+            op @ (WalOp::AlterAddColumn { .. }
+                | WalOp::AlterDropColumn { .. }
+                | WalOp::RenameTable { .. }
+                | WalOp::RenameColumn { .. }) => {
+                if alter::apply_alter(op)? { applied += 1; }
             }
             _ => {} // Commit, Checkpoint: no-op for now
         }
