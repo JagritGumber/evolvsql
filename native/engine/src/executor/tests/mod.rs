@@ -57,5 +57,6 @@ mod cte;
 mod cte_ext;
 mod upsert;
 mod upsert_ext;
+mod upsert_edge;
 mod devin_regressions;
 mod null_semantics;
