@@ -22,6 +22,11 @@ pub struct WalEntry {
 /// UPDATE/DELETE will affect the first match. This matches PostgreSQL's
 /// semantics for tables without a unique key (the "any matching row"
 /// contract).
+/// CRITICAL: bincode serializes enum variants by positional index, so
+/// the order of variants in this enum IS the on-disk format. Never
+/// reorder existing variants or insert new ones mid-list — doing so
+/// silently remaps every WAL file ever written. Always append new
+/// variants at the end.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOp {
     Insert { schema: String, table: String, row: Vec<Value> },
@@ -31,6 +36,11 @@ pub enum WalOp {
     CreateTable { table: Table },
     /// Drop a table by fully qualified name.
     DropTable { schema: String, table: String },
+    /// Marks a transaction boundary for group commit.
+    Commit { txn_id: u64 },
+    /// Marks the LSN up to which a memtable flush has persisted data.
+    /// Entries with LSN <= this are safe to truncate.
+    Checkpoint { up_to: Lsn },
     /// ALTER TABLE ADD COLUMN. fill_value is the resolved default used
     /// to backfill existing rows; logging it avoids re-evaluating
     /// non-deterministic defaults during replay.
@@ -42,11 +52,6 @@ pub enum WalOp {
     RenameTable { schema: String, old_name: String, new_name: String },
     /// ALTER TABLE RENAME COLUMN.
     RenameColumn { schema: String, table: String, old_column: String, new_column: String },
-    /// Marks a transaction boundary for group commit.
-    Commit { txn_id: u64 },
-    /// Marks the LSN up to which a memtable flush has persisted data.
-    /// Entries with LSN <= this are safe to truncate.
-    Checkpoint { up_to: Lsn },
 }
 
 // Op tag byte used in the on-disk frame. Kept stable: never renumber.
