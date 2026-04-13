@@ -92,9 +92,14 @@ pub fn drop_table(schema: &str, name: &str) {
 }
 
 #[allow(dead_code)]
+/// Unchecked, non-logging insert used ONLY by recovery replay. Writes
+/// the row and also updates unique/PK indexes so that post-recovery
+/// constraint checks see the correct state. Does not touch the WAL.
 pub fn insert(schema: &str, name: &str, row: Row) -> Result<(), String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
+    let row_idx = table.rows.len();
+    add_to_indexes(&mut table, &row, row_idx);
     table.rows.push(row);
     Ok(())
 }
@@ -417,6 +422,10 @@ pub fn insert_upsert(
     let mut inserted: u64 = 0;
     let mut updated: u64 = 0;
     let mut affected_rows: Vec<Row> = Vec::new();
+    // WAL ops queued for atomic log-then-commit. DO NOTHING rows do
+    // not produce entries because they make no state change.
+    enum PendingWal { Insert(Row), Update(Row, Row) }
+    let mut pending_wal: Vec<PendingWal> = Vec::new();
 
     for row in rows {
         let conflict_idx = find_conflict_on(
@@ -426,7 +435,6 @@ pub fn insert_upsert(
 
         match conflict_idx {
             None => {
-                // Validate ALL unique constraints before inserting (not just conflict target)
                 check_all_unique(
                     &working_indexes, &working_pk, &pk_cols_vec,
                     &row, unique_checks, pk_cols,
@@ -436,14 +444,14 @@ pub fn insert_upsert(
                     &mut working_indexes, &mut working_pk, &pk_cols_vec,
                     &row, row_idx,
                 );
+                pending_wal.push(PendingWal::Insert(row.clone()));
                 affected_rows.push(row.clone());
                 working_rows.push(row);
                 inserted += 1;
             }
             Some(idx) if do_update => {
-                let existing = &working_rows[idx];
-                let new_row = updater(existing, &row)?;
-                // Remove old values from working indexes
+                let old_row = working_rows[idx].clone();
+                let new_row = updater(&old_row, &row)?;
                 remove_from_working_indexes(
                     &mut working_indexes, &mut working_pk, &pk_cols_vec,
                     &working_rows[idx], idx,
@@ -453,21 +461,32 @@ pub fn insert_upsert(
                     &mut working_indexes, &mut working_pk, &pk_cols_vec,
                     &new_row, idx,
                 );
+                pending_wal.push(PendingWal::Update(old_row, new_row.clone()));
                 affected_rows.push(new_row);
                 updated += 1;
             }
-            Some(_) => {
-                // Conflict + DO NOTHING
+            Some(_) => {}
+        }
+    }
+
+    // Log to WAL BEFORE the atomic swap so recovery can replay the
+    // same state. Each append fsyncs; a failure here aborts the upsert
+    // without touching the in-memory store.
+    for op in &pending_wal {
+        match op {
+            PendingWal::Insert(row) => {
+                crate::wal::manager::append_insert(schema, name, row)?;
+            }
+            PendingWal::Update(old_row, new_row) => {
+                crate::wal::manager::append_update(schema, name, old_row, new_row)?;
             }
         }
     }
 
-    // All rows succeeded - commit atomically
     if inserted > 0 || updated > 0 {
         table.rows = working_rows;
         table.unique_indexes = working_indexes;
         table.pk_index = working_pk;
-        // HNSW needs full rebuild since row positions matter
         if table.hnsw_index.is_some() {
             rebuild_hnsw(&mut table);
         }
