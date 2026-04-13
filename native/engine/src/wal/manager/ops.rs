@@ -1,4 +1,4 @@
-use crate::catalog::Table;
+use crate::catalog::{Column, Table};
 use crate::types::Value;
 
 use super::super::{Lsn, WalOp};
@@ -45,6 +45,42 @@ pub fn append_drop_table(schema: &str, table: &str) -> Result<Option<Lsn>, Strin
     append_op(WalOp::DropTable {
         schema: schema.to_string(),
         table: table.to_string(),
+    })
+}
+
+/// Append an ALTER TABLE ADD COLUMN entry. fill_value is the resolved
+/// default used to backfill existing rows at ALTER time.
+pub fn append_alter_add_column(schema: &str, table: &str, column: &Column, fill_value: &Value) -> Result<Option<Lsn>, String> {
+    append_op(WalOp::AlterAddColumn {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        column: column.clone(),
+        fill_value: fill_value.clone(),
+    })
+}
+
+pub fn append_alter_drop_column(schema: &str, table: &str, column: &str) -> Result<Option<Lsn>, String> {
+    append_op(WalOp::AlterDropColumn {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        column: column.to_string(),
+    })
+}
+
+pub fn append_rename_table(schema: &str, old_name: &str, new_name: &str) -> Result<Option<Lsn>, String> {
+    append_op(WalOp::RenameTable {
+        schema: schema.to_string(),
+        old_name: old_name.to_string(),
+        new_name: new_name.to_string(),
+    })
+}
+
+pub fn append_rename_column(schema: &str, table: &str, old_column: &str, new_column: &str) -> Result<Option<Lsn>, String> {
+    append_op(WalOp::RenameColumn {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        old_column: old_column.to_string(),
+        new_column: new_column.to_string(),
     })
 }
 

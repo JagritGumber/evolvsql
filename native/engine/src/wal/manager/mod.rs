@@ -13,7 +13,12 @@ mod lifecycle;
 mod ops;
 
 pub use lifecycle::{enable, enable_at_lsn, enable_from_env, disable, is_enabled, read_all, suspend_for_replay};
-pub use ops::{append_insert, append_update, append_delete, append_create_table, append_drop_table};
+pub use ops::{
+    append_insert, append_update, append_delete,
+    append_create_table, append_drop_table,
+    append_alter_add_column, append_alter_drop_column,
+    append_rename_table, append_rename_column,
+};
 
 use std::sync::Arc;
 use parking_lot::RwLock;

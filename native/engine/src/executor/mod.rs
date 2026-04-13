@@ -35,6 +35,7 @@ mod having;
 mod returning;
 mod ddl;
 mod ddl_alter;
+mod ddl_ctas;
 mod insert;
 mod insert_conflict;
 mod delete;
@@ -88,7 +89,7 @@ pub fn execute(sql: &str) -> Result<QueryResult, String> {
         NodeEnum::TransactionStmt(_) => Ok(QueryResult { tag: "OK".into(), columns: vec![], rows: vec![] }),
         NodeEnum::AlterTableStmt(alter) => ddl_alter::exec_alter_table(alter),
         NodeEnum::RenameStmt(rename) => ddl_alter::exec_rename(rename),
-        NodeEnum::CreateTableAsStmt(ctas) => ddl_alter::exec_create_table_as(ctas),
+        NodeEnum::CreateTableAsStmt(ctas) => ddl_ctas::exec_create_table_as(ctas),
         _ => Err("unsupported statement type".into()),
     }
 }

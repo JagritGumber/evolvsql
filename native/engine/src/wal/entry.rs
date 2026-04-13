@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::Table;
+use crate::catalog::{Column, Table};
 use crate::types::Value;
 use super::Lsn;
 
@@ -22,6 +22,11 @@ pub struct WalEntry {
 /// UPDATE/DELETE will affect the first match. This matches PostgreSQL's
 /// semantics for tables without a unique key (the "any matching row"
 /// contract).
+/// CRITICAL: bincode serializes enum variants by positional index, so
+/// the order of variants in this enum IS the on-disk format. Never
+/// reorder existing variants or insert new ones mid-list — doing so
+/// silently remaps every WAL file ever written. Always append new
+/// variants at the end.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOp {
     Insert { schema: String, table: String, row: Vec<Value> },
@@ -36,6 +41,17 @@ pub enum WalOp {
     /// Marks the LSN up to which a memtable flush has persisted data.
     /// Entries with LSN <= this are safe to truncate.
     Checkpoint { up_to: Lsn },
+    /// ALTER TABLE ADD COLUMN. fill_value is the resolved default used
+    /// to backfill existing rows; logging it avoids re-evaluating
+    /// non-deterministic defaults during replay.
+    AlterAddColumn { schema: String, table: String, column: Column, fill_value: Value },
+    /// ALTER TABLE DROP COLUMN, keyed by column name so replay is
+    /// robust to position shifts from prior DROPs.
+    AlterDropColumn { schema: String, table: String, column: String },
+    /// ALTER TABLE RENAME TO.
+    RenameTable { schema: String, old_name: String, new_name: String },
+    /// ALTER TABLE RENAME COLUMN.
+    RenameColumn { schema: String, table: String, old_column: String, new_column: String },
 }
 
 // Op tag byte used in the on-disk frame. Kept stable: never renumber.
@@ -46,6 +62,10 @@ pub(super) const OP_COMMIT: u8 = 4;
 pub(super) const OP_CHECKPOINT: u8 = 5;
 pub(super) const OP_CREATE_TABLE: u8 = 6;
 pub(super) const OP_DROP_TABLE: u8 = 7;
+pub(super) const OP_ALTER_ADD_COL: u8 = 8;
+pub(super) const OP_ALTER_DROP_COL: u8 = 9;
+pub(super) const OP_RENAME_TABLE: u8 = 10;
+pub(super) const OP_RENAME_COL: u8 = 11;
 
 impl WalOp {
     pub(super) fn tag(&self) -> u8 {
@@ -57,6 +77,10 @@ impl WalOp {
             WalOp::Checkpoint { .. } => OP_CHECKPOINT,
             WalOp::CreateTable { .. } => OP_CREATE_TABLE,
             WalOp::DropTable { .. } => OP_DROP_TABLE,
+            WalOp::AlterAddColumn { .. } => OP_ALTER_ADD_COL,
+            WalOp::AlterDropColumn { .. } => OP_ALTER_DROP_COL,
+            WalOp::RenameTable { .. } => OP_RENAME_TABLE,
+            WalOp::RenameColumn { .. } => OP_RENAME_COL,
         }
     }
 
