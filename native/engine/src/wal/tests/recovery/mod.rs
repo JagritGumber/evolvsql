@@ -5,6 +5,7 @@ mod basic;
 mod errors;
 mod vector;
 mod mutations;
+mod ddl;
 
 pub(super) fn tmp_recovery_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

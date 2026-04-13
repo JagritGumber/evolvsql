@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::Table;
 use crate::types::Value;
 use super::Lsn;
 
 /// A single WAL entry: a log sequence number + the operation it records.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct WalEntry {
     pub lsn: Lsn,
     pub op: WalOp,
@@ -21,11 +22,15 @@ pub struct WalEntry {
 /// UPDATE/DELETE will affect the first match. This matches PostgreSQL's
 /// semantics for tables without a unique key (the "any matching row"
 /// contract).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOp {
     Insert { schema: String, table: String, row: Vec<Value> },
     Update { schema: String, table: String, old_row: Vec<Value>, new_row: Vec<Value> },
     Delete { schema: String, table: String, old_row: Vec<Value> },
+    /// Full table definition. Replay constructs the table via catalog + storage.
+    CreateTable { table: Table },
+    /// Drop a table by fully qualified name.
+    DropTable { schema: String, table: String },
     /// Marks a transaction boundary for group commit.
     Commit { txn_id: u64 },
     /// Marks the LSN up to which a memtable flush has persisted data.
@@ -39,6 +44,8 @@ pub(super) const OP_UPDATE: u8 = 2;
 pub(super) const OP_DELETE: u8 = 3;
 pub(super) const OP_COMMIT: u8 = 4;
 pub(super) const OP_CHECKPOINT: u8 = 5;
+pub(super) const OP_CREATE_TABLE: u8 = 6;
+pub(super) const OP_DROP_TABLE: u8 = 7;
 
 impl WalOp {
     pub(super) fn tag(&self) -> u8 {
@@ -48,6 +55,8 @@ impl WalOp {
             WalOp::Delete { .. } => OP_DELETE,
             WalOp::Commit { .. } => OP_COMMIT,
             WalOp::Checkpoint { .. } => OP_CHECKPOINT,
+            WalOp::CreateTable { .. } => OP_CREATE_TABLE,
+            WalOp::DropTable { .. } => OP_DROP_TABLE,
         }
     }
 

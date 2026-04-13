@@ -26,6 +26,27 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
                 apply_delete(schema, table, old_row)?;
                 applied += 1;
             }
+            WalOp::CreateTable { table } => {
+                // Idempotent: skip if table already exists in this
+                // session (e.g., partial replay or double-recover).
+                if catalog::get_table(&table.schema, &table.name).is_some() { continue; }
+                catalog::create_table(table.clone())?;
+                storage::create_table(&table.schema, &table.name);
+                // Re-build indexes for any columns with PK/UNIQUE constraints
+                for (i, col) in table.columns.iter().enumerate() {
+                    if col.primary_key || col.unique {
+                        let _ = storage::add_unique_index(&table.schema, &table.name, i);
+                    }
+                }
+                applied += 1;
+            }
+            WalOp::DropTable { schema, table } => {
+                if catalog::get_table(schema, table).is_some() {
+                    catalog::drop_table(schema, table)?;
+                    storage::drop_table(schema, table);
+                }
+                applied += 1;
+            }
             _ => {} // Commit, Checkpoint: no-op for now
         }
     }

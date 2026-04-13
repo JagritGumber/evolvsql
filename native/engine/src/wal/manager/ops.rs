@@ -1,3 +1,4 @@
+use crate::catalog::Table;
 use crate::types::Value;
 
 use super::super::{Lsn, WalOp};
@@ -30,6 +31,20 @@ pub fn append_delete(schema: &str, table: &str, old_row: &[Value]) -> Result<Opt
         schema: schema.to_string(),
         table: table.to_string(),
         old_row: old_row.to_vec(),
+    })
+}
+
+/// Append a CreateTable entry. The full table definition is serialized
+/// so recovery can recreate catalog + storage state without re-parsing SQL.
+pub fn append_create_table(table: &Table) -> Result<Option<Lsn>, String> {
+    append_op(WalOp::CreateTable { table: table.clone() })
+}
+
+/// Append a DropTable entry.
+pub fn append_drop_table(schema: &str, table: &str) -> Result<Option<Lsn>, String> {
+    append_op(WalOp::DropTable {
+        schema: schema.to_string(),
+        table: table.to_string(),
     })
 }
 

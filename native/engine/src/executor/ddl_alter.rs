@@ -21,6 +21,8 @@ pub(crate) fn exec_drop(drop: &pg_query::protobuf::DropStmt) -> Result<QueryResu
             if drop.missing_ok && catalog::get_table(schema, name).is_none() { continue; }
             catalog::drop_table(schema, name)?;
             storage::drop_table(schema, name);
+            // WAL: log drop so recovery doesn't replay the table creation
+            crate::wal::manager::append_drop_table(schema, name)?;
         }
     }
     Ok(QueryResult { tag: "DROP TABLE".into(), columns: vec![], rows: vec![] })

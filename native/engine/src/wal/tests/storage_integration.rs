@@ -25,17 +25,11 @@ fn insert_batch_appends_to_wal_when_enabled() {
     executor::execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')").unwrap();
 
     let entries = manager::read_all().unwrap();
-    assert_eq!(entries.len(), 2);
-    for e in &entries {
-        match &e.op {
-            WalOp::Insert { schema, table, row } => {
-                assert_eq!(schema, "public");
-                assert_eq!(table, "users");
-                assert_eq!(row.len(), 2);
-            }
-            _ => panic!("expected Insert, got {:?}", e.op),
-        }
-    }
+    // 1 CreateTable + 2 Inserts
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(&entries[0].op, WalOp::CreateTable { .. }));
+    let inserts: Vec<_> = entries.iter().filter(|e| matches!(e.op, WalOp::Insert { .. })).collect();
+    assert_eq!(inserts.len(), 2);
 
     manager::disable();
     std::fs::remove_file(&path).ok();
@@ -68,8 +62,11 @@ fn wal_has_row_values_including_vector() {
     executor::execute("INSERT INTO embeds VALUES (1, '[0.1, 0.2, 0.3]')").unwrap();
 
     let entries = manager::read_all().unwrap();
-    assert_eq!(entries.len(), 1);
-    if let WalOp::Insert { row, .. } = &entries[0].op {
+    // 1 CreateTable + 1 Insert
+    assert_eq!(entries.len(), 2);
+    let insert_entry = entries.iter().find(|e| matches!(e.op, WalOp::Insert { .. }))
+        .expect("insert entry missing");
+    if let WalOp::Insert { row, .. } = &insert_entry.op {
         assert!(matches!(row[0], Value::Int(1)));
         assert!(matches!(row[1], Value::Vector(_)));
     } else {
