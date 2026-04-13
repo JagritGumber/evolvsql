@@ -15,6 +15,7 @@ mod sequences;
 mod vector_knn;
 mod torn_write;
 mod multi_cycle;
+mod composite_pk;
 
 pub(super) fn tmp_recovery_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

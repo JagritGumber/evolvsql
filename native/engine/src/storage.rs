@@ -86,6 +86,28 @@ pub fn add_pk_index(schema: &str, name: &str, pk_cols: &[usize]) -> Result<(), S
     Ok(())
 }
 
+/// Build all indexes for a freshly-created table from its catalog entry.
+/// Single-column PK or UNIQUE columns get per-column hash indexes;
+/// composite PK (>1 column) gets a pk_index on the tuple and NO
+/// per-column unique indexes (those would over-constrain inserts that
+/// legitimately share a value in one PK column). Used by both the live
+/// CREATE TABLE path and WAL recovery replay so they stay in sync.
+pub fn setup_table_indexes(table: &crate::catalog::Table) -> Result<(), String> {
+    let pk_cols: Vec<usize> = table.columns.iter().enumerate()
+        .filter(|(_, c)| c.primary_key).map(|(i, _)| i).collect();
+    for (i, col) in table.columns.iter().enumerate() {
+        if col.primary_key && pk_cols.len() == 1 {
+            add_unique_index(&table.schema, &table.name, i)?;
+        } else if col.unique {
+            add_unique_index(&table.schema, &table.name, i)?;
+        }
+    }
+    if pk_cols.len() > 1 {
+        add_pk_index(&table.schema, &table.name, &pk_cols)?;
+    }
+    Ok(())
+}
+
 pub fn drop_table(schema: &str, name: &str) {
     let mut store = STORE.write();
     store.remove(&key(schema, name));
