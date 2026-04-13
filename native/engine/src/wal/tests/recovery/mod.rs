@@ -11,6 +11,8 @@ mod unique_constraints;
 mod bulk_ops;
 mod alter_columns;
 mod alter_rename;
+mod sequences;
+mod vector_knn;
 
 pub(super) fn tmp_recovery_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

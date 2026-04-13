@@ -93,6 +93,16 @@ pub fn list_tables(schema: &str) -> Vec<Table> {
         .collect()
 }
 
+/// Every table in the catalog regardless of schema. Recovery paths
+/// that walk all tables (e.g. advancing SERIAL sequences after WAL
+/// replay) must use this, not list_tables("public"): hardcoding the
+/// public schema would leave non-public sequences stuck at 0 and
+/// the next nextval would collide with replayed rows.
+pub fn list_all_tables() -> Vec<Table> {
+    let cat = CATALOG.read();
+    cat.tables.values().cloned().collect()
+}
+
 pub fn alter_table_add_column(schema: &str, table_name: &str, col: Column) -> Result<(), String> {
     let mut cat = CATALOG.write();
     let key = fqn(schema, table_name);

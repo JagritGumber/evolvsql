@@ -5,6 +5,7 @@ use crate::types::Value;
 use super::super::{WalEntry, WalOp};
 
 mod alter;
+mod sequences;
 
 /// Apply a list of entries to storage. Insert uses the unchecked path
 /// since constraints were already validated when logged. Update and
@@ -37,6 +38,7 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
                         let _ = storage::add_unique_index(&table.schema, &table.name, i);
                     }
                 }
+                sequences::recreate_for_table(table);
                 applied += 1;
             }
             WalOp::DropTable { schema, table } => {
@@ -55,6 +57,11 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
             _ => {} // Commit, Checkpoint: no-op for now
         }
     }
+    // After replay, walk every catalog table and advance any SERIAL
+    // sequence past the max value present in storage. This handles
+    // both inserts that used nextval and inserts that supplied an
+    // explicit higher id.
+    sequences::advance_all_to_max();
     Ok(applied)
 }
 
