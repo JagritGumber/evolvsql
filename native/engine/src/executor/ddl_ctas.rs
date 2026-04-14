@@ -30,9 +30,11 @@ pub(crate) fn exec_create_table_as(ctas: &pg_query::protobuf::CreateTableAsStmt)
         default_expr: None,
     }).collect();
     let table = catalog::Table { name: table_name.clone(), schema: schema.to_string(), columns: table_columns };
+    // WAL-first: the INSERTs below already log themselves via the
+    // checked batch path, so just the CREATE TABLE step needs reordering.
+    crate::wal::manager::append_create_table(&table)?;
     catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
-    crate::wal::manager::append_create_table(&table)?;
     let rows: Vec<Vec<crate::types::Value>> = raw_rows.iter()
         .map(|row| row.iter().map(|v| v.to_value(&arena)).collect())
         .collect();
