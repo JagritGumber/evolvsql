@@ -159,6 +159,56 @@ fn concurrent_append_sync_with_failing_peer_preserves_other_thread_durability() 
 }
 
 #[test]
+fn append_sync_clears_undurable_marker_so_later_rollback_does_not_rewind_too_far() {
+    // Devin-found: append_sync's success path used to leave
+    // `undurable_start_lsn` stale. A subsequent batched append +
+    // failing flush_sync would then see the stale marker and rewind
+    // `next_lsn` past frames that were already durable, causing
+    // duplicate LSNs on the next write. Sequence:
+    //
+    //   1. append(A)          → undurable_start_lsn = Some(LSN_A)
+    //   2. append_sync(B)     → fsyncs A+B, but forgets to clear
+    //                           undurable_start_lsn
+    //   3. append(C)          → no-op on the marker (already set)
+    //   4. flush_sync fails   → rollback reads stale Some(LSN_A) and
+    //                           stores next_lsn = LSN_A, past already
+    //                           durable frames
+    //   5. append(D)          → reuses LSN_A, duplicate on disk
+    let path = tmp("append_sync_clears_marker");
+    let writer = WalWriter::open(&path, 1).unwrap();
+
+    let lsn_a = writer.append(insert_op(1, "a")).unwrap();
+    assert_eq!(lsn_a, 1);
+    let entry_b = writer.append_sync(insert_op(2, "b")).unwrap();
+    assert_eq!(entry_b.lsn, 2);
+    let lsn_c = writer.append(insert_op(3, "c")).unwrap();
+    assert_eq!(lsn_c, 3);
+    writer.fail_next_sync.store(true, Ordering::SeqCst);
+    assert!(writer.flush_sync().is_err());
+
+    // The rollback must only unwind frame C, NOT frames A and B.
+    // Without the fix, next_lsn would rewind to 1 and the retry
+    // below would reuse LSN 1, leaving two frames with LSN 1 on disk.
+    assert_eq!(
+        writer.peek_next_lsn(),
+        3,
+        "rollback must not rewind past the durable tail"
+    );
+
+    let entry_d = writer.append_sync(insert_op(4, "d")).unwrap();
+    assert_eq!(entry_d.lsn, 3);
+
+    drop(writer);
+    let entries = WalReader::open(&path).unwrap().read_all().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].lsn, 1);
+    assert_eq!(entries[1].lsn, 2);
+    assert_eq!(entries[2].lsn, 3);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn flush_sync_failure_keeps_prior_durable_entries() {
     // A failed flush must NOT discard anything that had been made
     // durable by an earlier successful flush. The truncate-back

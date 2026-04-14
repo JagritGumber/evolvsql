@@ -184,6 +184,11 @@ impl WalWriter {
             .stream_position()
             .map_err(|e| format!("WAL stream_position: {}", e))?;
         state.durable_len = new_len;
+        // `sync_data` fsyncs the whole file, so any frames left over
+        // from prior `append` calls are now durable too. Clear the
+        // batch marker so a later failing `flush_sync` doesn't rewind
+        // `next_lsn` past frames that are already on disk.
+        state.undurable_start_lsn = None;
         self.next_lsn.store(lsn + 1, Ordering::SeqCst);
         Ok(WalEntry { lsn, op })
     }
