@@ -30,8 +30,16 @@ pub(super) fn compute_zone_map(values: &[Value]) -> (Option<Value>, Option<Value
 }
 
 /// Whether a value type participates in zone map min/max tracking.
+/// NaN floats are deliberately excluded: every NaN comparison via
+/// `less_than` returns false, so allowing a NaN into the accumulator
+/// would freeze it at NaN forever and silently drop every real
+/// follow-up value (min/max would both be stuck on NaN).
 fn has_zone_order(v: &Value) -> bool {
-    matches!(v, Value::Int(_) | Value::Float(_) | Value::Text(_) | Value::Bool(_))
+    match v {
+        Value::Int(_) | Value::Text(_) | Value::Bool(_) => true,
+        Value::Float(f) => !f.is_nan(),
+        _ => false,
+    }
 }
 
 /// Strict less-than comparison for zone map tracking. Only defined for

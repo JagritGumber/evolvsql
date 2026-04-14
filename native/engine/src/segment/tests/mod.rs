@@ -7,6 +7,7 @@ mod basic;
 mod zone_maps;
 mod large;
 mod edge_types;
+mod zone_map_nan;
 
 pub(super) fn tmp_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
