@@ -928,7 +928,22 @@ pub fn alter_drop_column(schema: &str, name: &str, col_idx: usize) {
         for c in t.pk_cols.iter_mut() {
             if *c > col_idx { *c -= 1; }
         }
-        t.pk_index = None; // force rebuild on next insert
+        // Composite PK: rebuild the tuple index from the new row slice.
+        // Setting pk_index = None (the old behavior) silently disabled
+        // duplicate-key checks in insert_batch_checked line 378, which
+        // reads `if let Some(ref pk_idx) = table.pk_index`. A None
+        // index means every check short-circuits, and two separate
+        // INSERT statements can land duplicate composite keys.
+        if t.pk_cols.len() > 1 {
+            let mut pk_idx = HashMap::new();
+            for (row_idx, row) in t.rows.iter().enumerate() {
+                let key: Vec<Value> = t.pk_cols.iter().map(|&i| row[i].clone()).collect();
+                pk_idx.insert(key, row_idx);
+            }
+            t.pk_index = Some(pk_idx);
+        } else {
+            t.pk_index = None;
+        }
         t.hnsw_index = None; // invalidate - will be lazily recreated
     }
 }
