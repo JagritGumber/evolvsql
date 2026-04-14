@@ -100,6 +100,65 @@ fn flush_sync_failure_rewinds_next_lsn() {
 }
 
 #[test]
+fn concurrent_append_sync_with_failing_peer_preserves_other_thread_durability() {
+    // Devin-found concurrency hole: `append` and `flush_sync` are not
+    // atomic. Without the combined `append_sync` path holding the
+    // mutex across both, the following interleaving silently loses
+    // data:
+    //
+    //   T1: append(A)        // frame A on disk, mutex released
+    //   T2: append(B)        // frame B on disk, mutex released
+    //   T1: flush_sync fails // rollback truncates BOTH frames
+    //   T2: flush_sync       // sync on empty tail, returns Ok(())
+    //
+    // T2's caller believes B is durable but it was truncated.
+    // The production path now uses `append_sync`, which holds the
+    // inner mutex across both steps. T2 cannot acquire the lock
+    // until T1's rollback has finished and returned an error, so on
+    // its own entry T2 starts from the durable tail.
+    use std::sync::Arc;
+    use std::thread;
+
+    let path = tmp("concurrent_failing_peer");
+    let writer = Arc::new(WalWriter::open(&path, 1).unwrap());
+
+    // Pre-arm one failed sync. The thread that grabs the lock first
+    // will fail; the thread that comes second must still land
+    // durably.
+    writer.fail_next_sync.store(true, Ordering::SeqCst);
+
+    let w1 = Arc::clone(&writer);
+    let w2 = Arc::clone(&writer);
+    let h1 = thread::spawn(move || w1.append_sync(insert_op(1, "first")));
+    let h2 = thread::spawn(move || w2.append_sync(insert_op(2, "second")));
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+
+    assert_eq!(
+        r1.is_err() as u8 + r2.is_err() as u8,
+        1,
+        "exactly one append_sync should fail: {:?} {:?}",
+        r1,
+        r2
+    );
+    let ok_entry = match (r1, r2) {
+        (Ok(e), Err(_)) | (Err(_), Ok(e)) => e,
+        other => panic!("unexpected outcome: {:?}", other),
+    };
+
+    drop(writer);
+    let entries = WalReader::open(&path).unwrap().read_all().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the successful append_sync must land durably"
+    );
+    assert_eq!(entries[0].lsn, ok_entry.lsn);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn flush_sync_failure_keeps_prior_durable_entries() {
     // A failed flush must NOT discard anything that had been made
     // durable by an earlier successful flush. The truncate-back

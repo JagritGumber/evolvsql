@@ -148,12 +148,56 @@ impl WalWriter {
         self.next_lsn.load(Ordering::SeqCst)
     }
 
-    /// Convenience: append + flush in one call.
+    /// Append a frame AND fsync it in a single locked section. This is
+    /// the concurrency-safe path and the one production callers must
+    /// use. The naive composition of `append` + `flush_sync` releases
+    /// the inner mutex between the two and is unsafe: thread A's
+    /// failing `flush_sync` can roll back to `durable_len`, truncating
+    /// thread B's successfully-appended-but-not-yet-flushed frame. B's
+    /// subsequent `flush_sync` would then trivially succeed (nothing
+    /// left to sync) and return Ok, silently violating its durability
+    /// contract. Holding the mutex across both steps eliminates the
+    /// interleaving entirely — no other thread can observe or be
+    /// affected by a partial state, and the rollback path only ever
+    /// sees the one frame this call wrote.
     pub fn append_sync(&self, op: WalOp) -> Result<WalEntry, String> {
-        let lsn = self.append(op.clone())?;
-        self.flush_sync()?;
+        let payload = op.encode_payload()?;
+        let tag = op.tag();
+        let mut state = self.inner.lock();
+        let lsn = self.next_lsn.load(Ordering::SeqCst);
+        let frame = encode_frame(lsn, tag, &payload);
+        if let Err(e) = state.file.write_all(&frame) {
+            single_frame_rollback(&mut state);
+            return Err(format!("WAL write: {}", e));
+        }
+        #[cfg(test)]
+        if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+            single_frame_rollback(&mut state);
+            return Err("WAL fsync: test injected failure".into());
+        }
+        if let Err(e) = state.file.sync_data() {
+            single_frame_rollback(&mut state);
+            return Err(format!("WAL fsync: {}", e));
+        }
+        let new_len = state
+            .file
+            .stream_position()
+            .map_err(|e| format!("WAL stream_position: {}", e))?;
+        state.durable_len = new_len;
+        self.next_lsn.store(lsn + 1, Ordering::SeqCst);
         Ok(WalEntry { lsn, op })
     }
+}
+
+/// Rollback helper for `append_sync`'s single-frame scope. Unlike the
+/// batched `rollback`, this never touches `undurable_start_lsn` or
+/// `next_lsn`: because `append_sync` holds the mutex across the entire
+/// write+sync and advances `next_lsn` only on success, there is no
+/// cross-call LSN state to unwind. Truncating the file and resetting
+/// the cursor is enough.
+fn single_frame_rollback(state: &mut WriterState) {
+    let _ = state.file.set_len(state.durable_len);
+    let _ = state.file.seek(SeekFrom::Start(state.durable_len));
 }
 
 /// Roll the writer's state back to the last durable boundary. Called
