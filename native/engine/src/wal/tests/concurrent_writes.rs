@@ -62,12 +62,21 @@ fn concurrent_inserts_to_multiple_tables_recover_cleanly() {
         );
     }
 
-    // WAL file order must still match LSN order — the writer.rs fix
-    // puts the fetch_add inside the mutex specifically so this holds.
+    // WAL file order must still match LSN order AND be contiguous —
+    // the writer.rs fix puts the fetch_add inside the mutex so the
+    // Nth frame has LSN = starting_lsn + N - 1. A gap (e.g. 1, 2, 4)
+    // would mean the writer lost a frame between append and flush,
+    // which is the exact durability hole #62 closed.
     let entries = manager::read_all().unwrap();
     let mut prev = 0u64;
     for e in &entries {
-        assert!(e.lsn > prev, "WAL file out of LSN order: {} after {}", e.lsn, prev);
+        assert_eq!(
+            e.lsn,
+            prev + 1,
+            "LSN gap or reorder: expected {} but got {}",
+            prev + 1,
+            e.lsn
+        );
         prev = e.lsn;
     }
 
