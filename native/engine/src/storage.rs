@@ -904,8 +904,26 @@ pub fn alter_drop_column(schema: &str, name: &str, col_idx: usize) {
                 row.remove(col_idx);
             }
         }
-        // Fix all index references after column removal
-        t.unique_indexes.clear();
+        // Drop only the unique index on the removed column, shift the
+        // remaining index keys down by 1 for columns that were to the
+        // right of col_idx, and rebuild each one from the new row
+        // slice. Clearing the whole map (what this function used to do)
+        // silently destroyed UNIQUE constraints on every other column.
+        let mut new_unique: std::collections::HashMap<usize, HashMap<Value, usize>> =
+            std::collections::HashMap::new();
+        let old_cols: Vec<usize> = t.unique_indexes.keys().copied().collect();
+        for c in old_cols {
+            if c == col_idx { continue; }
+            let new_c = if c > col_idx { c - 1 } else { c };
+            let mut idx = HashMap::new();
+            for (row_idx, row) in t.rows.iter().enumerate() {
+                if new_c < row.len() && !matches!(row[new_c], Value::Null) {
+                    idx.insert(row[new_c].clone(), row_idx);
+                }
+            }
+            new_unique.insert(new_c, idx);
+        }
+        t.unique_indexes = new_unique;
         t.pk_cols.retain(|c| *c != col_idx);
         for c in t.pk_cols.iter_mut() {
             if *c > col_idx { *c -= 1; }

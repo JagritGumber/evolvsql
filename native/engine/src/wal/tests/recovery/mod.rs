@@ -19,6 +19,7 @@ mod composite_pk;
 mod update_pk;
 mod alter_defaults;
 mod null_updates;
+mod alter_preserves_unique;
 
 pub(super) fn tmp_recovery_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
