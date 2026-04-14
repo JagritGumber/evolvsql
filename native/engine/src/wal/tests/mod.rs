@@ -10,6 +10,7 @@ mod manager_tests;
 mod storage_integration;
 mod recovery;
 mod writer_concurrent;
+mod writer_rollback;
 mod concurrent_writes;
 
 pub(super) fn tmp_wal_path(name: &str) -> std::path::PathBuf {
