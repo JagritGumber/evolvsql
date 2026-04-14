@@ -34,7 +34,7 @@ pub(crate) fn exec_create_table_as(ctas: &pg_query::protobuf::CreateTableAsStmt)
     // checked batch path, so just the CREATE TABLE step needs reordering.
     crate::wal::manager::append_create_table(&table)?;
     catalog::create_table(table.clone())?;
-    storage::create_table(schema, table_name);
+    storage::create_table(schema, table_name)?;
     let rows: Vec<Vec<crate::types::Value>> = raw_rows.iter()
         .map(|row| row.iter().map(|v| v.to_value(&arena)).collect())
         .collect();

@@ -44,18 +44,35 @@ fn get_table(schema: &str, name: &str) -> Result<Arc<RwLock<TableStore>>, String
         .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))
 }
 
-pub fn create_table(schema: &str, name: &str) {
+/// Register an empty storage slot for a new table. Returns Err if a
+/// slot already exists at `schema.name` instead of silently replacing
+/// it — a duplicate call would detach the existing TableStore (and
+/// every row, index, and HNSW it holds) from the public map while
+/// other threads still held Arc clones pointing at the old one,
+/// leaving behind a zombie that could never be queried. Callers are
+/// expected to have already gated on `catalog::create_table`, which
+/// rejects duplicates at the schema layer, so hitting this error
+/// means the catalog and storage maps have drifted apart — a bug
+/// worth surfacing loudly rather than papering over.
+pub fn create_table(schema: &str, name: &str) -> Result<(), String> {
     let mut store = STORE.write();
-    store.insert(
-        key(schema, name),
-        Arc::new(RwLock::new(TableStore {
-            rows: Vec::new(),
-            unique_indexes: HashMap::new(),
-            pk_cols: Vec::new(),
-            pk_index: None,
-            hnsw_index: None,
-        })),
-    );
+    use std::collections::hash_map::Entry;
+    match store.entry(key(schema, name)) {
+        Entry::Occupied(_) => Err(format!(
+            "storage::create_table: {}.{} already exists",
+            schema, name
+        )),
+        Entry::Vacant(slot) => {
+            slot.insert(Arc::new(RwLock::new(TableStore {
+                rows: Vec::new(),
+                unique_indexes: HashMap::new(),
+                pk_cols: Vec::new(),
+                pk_index: None,
+                hnsw_index: None,
+            })));
+            Ok(())
+        }
+    }
 }
 
 /// Register a hash index for a unique/PK column. O(1) constraint checks.
@@ -975,7 +992,7 @@ mod tests {
     #[serial_test::serial]
     fn insert_and_scan() {
         reset();
-        create_table("public", "t");
+        create_table("public", "t").unwrap();
         insert(
             "public",
             "t",
@@ -997,11 +1014,40 @@ mod tests {
     #[serial_test::serial]
     fn delete_all_works() {
         reset();
-        create_table("public", "t");
+        create_table("public", "t").unwrap();
         insert("public", "t", vec![Value::Int(1)]).unwrap();
         insert("public", "t", vec![Value::Int(2)]).unwrap();
         let count = delete_all("public", "t").unwrap();
         assert_eq!(count, 2);
         assert_eq!(scan("public", "t").unwrap().len(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_table_rejects_duplicate() {
+        // Regression for the silent-overwrite hole. Prior behavior
+        // was HashMap::insert, which happily replaced the existing
+        // TableStore. Any rows or indexes the old store held would
+        // become orphans — still referenced by Arc clones any
+        // scan-in-flight thread had cloned, but no longer reachable
+        // from the public STORE map — so the data would look gone
+        // to everyone coming after the overwrite without producing
+        // an error. Now the second call errors out.
+        reset();
+        create_table("public", "t").unwrap();
+        insert("public", "t", vec![Value::Int(42)]).unwrap();
+
+        let err = create_table("public", "t").unwrap_err();
+        assert!(
+            err.contains("already exists"),
+            "expected 'already exists' error, got {:?}",
+            err
+        );
+
+        // The pre-existing store must still be intact — the failed
+        // second call must not have touched it.
+        let rows = scan("public", "t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(42));
     }
 }

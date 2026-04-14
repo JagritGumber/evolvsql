@@ -32,7 +32,7 @@ pub fn apply_entries(entries: &[WalEntry]) -> Result<usize, String> {
             WalOp::CreateTable { table } => {
                 if catalog::get_table(&table.schema, &table.name).is_some() { continue; }
                 catalog::create_table(table.clone())?;
-                storage::create_table(&table.schema, &table.name);
+                storage::create_table(&table.schema, &table.name)?;
                 storage::setup_table_indexes(table)?;
                 sequences::recreate_for_table(table);
                 applied += 1;
