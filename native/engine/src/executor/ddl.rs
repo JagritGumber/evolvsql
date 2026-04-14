@@ -46,7 +46,7 @@ pub(crate) fn exec_create_table(create: &pg_query::protobuf::CreateStmt) -> Resu
         e
     })?;
     catalog::create_table(table.clone())?;
-    storage::create_table(schema, table_name);
+    storage::create_table(schema, table_name)?;
     storage::setup_table_indexes(&table)?;
     Ok(QueryResult { tag: "CREATE TABLE".into(), columns: vec![], rows: vec![] })
 }
