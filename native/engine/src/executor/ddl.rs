@@ -28,11 +28,26 @@ pub(crate) fn exec_create_table(create: &pg_query::protobuf::CreateStmt) -> Resu
         for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
         return Ok(QueryResult { tag: "CREATE TABLE".into(), columns: vec![], rows: vec![] });
     }
+    // WAL-first: the log is the source of truth. If we persist intent
+    // first and then crash mid-mutation, recovery re-applies cleanly
+    // because the in-memory state is rebuilt from scratch. If we were
+    // to mutate first and then crash before the WAL append, recovery
+    // would have no record of the change and the next startup would
+    // look the same as before the DDL — but any user code that ran in
+    // the interim would have seen the table, producing ghost writes.
+    //
+    // On WAL append failure we must also drop any SERIAL sequences
+    // that `parse_column_def` created up-front: until this point
+    // nothing references them, and if we leave them lying around a
+    // retry of the same CREATE TABLE fails with "sequence already
+    // exists" and the engine is stuck refusing that DDL forever.
+    crate::wal::manager::append_create_table(&table).map_err(|e| {
+        for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+        e
+    })?;
     catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
     storage::setup_table_indexes(&table)?;
-    // WAL: log DDL so recovery can rebuild the schema without re-parsing SQL
-    crate::wal::manager::append_create_table(&table)?;
     Ok(QueryResult { tag: "CREATE TABLE".into(), columns: vec![], rows: vec![] })
 }
 

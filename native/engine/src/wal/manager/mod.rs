@@ -19,6 +19,8 @@ pub use ops::{
     append_alter_add_column, append_alter_drop_column,
     append_rename_table, append_rename_column,
 };
+#[cfg(test)]
+pub(crate) use ops::FAIL_NEXT_APPEND;
 
 use std::sync::Arc;
 use parking_lot::RwLock;

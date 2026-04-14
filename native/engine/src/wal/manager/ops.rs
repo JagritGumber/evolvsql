@@ -4,6 +4,18 @@ use crate::types::Value;
 use super::super::{Lsn, WalOp};
 use super::WAL;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Test-only fault injection: when set, the next `append_op` returns
+/// Err without touching the WAL writer. Used to exercise the error
+/// path of DDL callers — verifies that a WAL-write failure aborts the
+/// whole DDL op so catalog/storage mutations do not happen. Callers
+/// set this flag, run the DDL, and then assert the mutation did not
+/// land.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_APPEND: AtomicBool = AtomicBool::new(false);
+
 /// Append an Insert entry. No-op when WAL is disabled. Fsyncs before
 /// returning so the write is durable.
 pub fn append_insert(schema: &str, table: &str, row: &[Value]) -> Result<Option<Lsn>, String> {
@@ -87,6 +99,10 @@ pub fn append_rename_column(schema: &str, table: &str, old_column: &str, new_col
 /// Shared append + fsync path. Returns the assigned LSN on success,
 /// or None if the WAL is disabled (making this a no-op for callers).
 fn append_op(op: WalOp) -> Result<Option<Lsn>, String> {
+    #[cfg(test)]
+    if FAIL_NEXT_APPEND.swap(false, Ordering::SeqCst) {
+        return Err("test injected WAL failure".into());
+    }
     let guard = WAL.read();
     let Some(writer) = guard.as_ref() else { return Ok(None); };
     let lsn = writer.append(op)?;

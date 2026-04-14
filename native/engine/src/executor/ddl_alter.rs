@@ -17,10 +17,10 @@ pub(crate) fn exec_drop(drop: &pg_query::protobuf::DropStmt) -> Result<QueryResu
             let (schema, name) = if parts.len() >= 2 { (parts[0].as_str(), parts[1].as_str()) }
                 else if parts.len() == 1 { ("public", parts[0].as_str()) } else { continue; };
             if drop.missing_ok && catalog::get_table(schema, name).is_none() { continue; }
+            // WAL-first: see ddl.rs exec_create_table for the rationale.
+            crate::wal::manager::append_drop_table(schema, name)?;
             catalog::drop_table(schema, name)?;
             storage::drop_table(schema, name);
-            // WAL: log drop so recovery doesn't replay the table creation
-            crate::wal::manager::append_drop_table(schema, name)?;
         }
     }
     Ok(QueryResult { tag: "DROP TABLE".into(), columns: vec![], rows: vec![] })
@@ -51,15 +51,16 @@ pub(crate) fn exec_alter_table(alter: &pg_query::protobuf::AlterTableStmt) -> Re
                 }
             }
             let col = Column { name: col_def.colname.clone(), type_oid: TypeOid::from_name(&type_name), nullable: !col_def.is_not_null, primary_key: false, unique: false, default_expr: default_expr.clone() };
-            catalog::alter_table_add_column(schema, table_name, col.clone())?;
             let default_val = match &default_expr { Some(catalog::DefaultExpr::Literal(v)) => v.clone(), _ => crate::types::Value::Null };
-            storage::alter_add_column(schema, table_name, default_val.clone());
+            // WAL-first: see ddl.rs exec_create_table for the rationale.
             crate::wal::manager::append_alter_add_column(schema, table_name, &col, &default_val)?;
+            catalog::alter_table_add_column(schema, table_name, col.clone())?;
+            storage::alter_add_column(schema, table_name, default_val);
         } else if cmd.subtype == AlterTableType::AtDropColumn as i32 {
             let col_idx = catalog::get_column_index(schema, table_name, &cmd.name)?;
+            crate::wal::manager::append_alter_drop_column(schema, table_name, &cmd.name)?;
             catalog::alter_table_drop_column(schema, table_name, &cmd.name)?;
             storage::alter_drop_column(schema, table_name, col_idx);
-            crate::wal::manager::append_alter_drop_column(schema, table_name, &cmd.name)?;
         } else { return Err(format!("unsupported ALTER TABLE subcommand: {}", cmd.subtype)); }
     }
     Ok(QueryResult { tag: "ALTER TABLE".into(), columns: vec![], rows: vec![] })
@@ -71,13 +72,14 @@ pub(crate) fn exec_rename(rename: &pg_query::protobuf::RenameStmt) -> Result<Que
     let table_name = &rel.relname;
     let schema = if rel.schemaname.is_empty() { "public" } else { &rel.schemaname };
     use pg_query::protobuf::ObjectType;
+    // WAL-first: see ddl.rs exec_create_table for the rationale.
     if rename.rename_type == ObjectType::ObjectTable as i32 {
+        crate::wal::manager::append_rename_table(schema, table_name, &rename.newname)?;
         catalog::rename_table(schema, table_name, &rename.newname)?;
         storage::rename_table(schema, table_name, &rename.newname);
-        crate::wal::manager::append_rename_table(schema, table_name, &rename.newname)?;
     } else if rename.rename_type == ObjectType::ObjectColumn as i32 {
-        catalog::rename_column(schema, table_name, &rename.subname, &rename.newname)?;
         crate::wal::manager::append_rename_column(schema, table_name, &rename.subname, &rename.newname)?;
+        catalog::rename_column(schema, table_name, &rename.subname, &rename.newname)?;
     } else { return Err("unsupported RENAME type".into()); }
     Ok(QueryResult { tag: "ALTER TABLE".into(), columns: vec![], rows: vec![] })
 }
