@@ -470,7 +470,7 @@ pub fn insert_upsert(
         match conflict_idx {
             None => {
                 check_all_unique(
-                    &working_indexes, &working_pk, &pk_cols_vec,
+                    &working_indexes, &working_pk,
                     &row, unique_checks, pk_cols,
                 )?;
                 let row_idx = working_rows.len();
@@ -608,13 +608,12 @@ fn remove_from_working_indexes(
 fn check_all_unique(
     unique_indexes: &HashMap<usize, HashMap<Value, usize>>,
     pk_index: &Option<HashMap<Vec<Value>, usize>>,
-    pk_cols: &[usize],
     row: &Row,
     unique_checks: &[(usize, String)],
-    all_pk_cols: &[usize],
+    pk_cols: &[usize],
 ) -> Result<(), String> {
-    if all_pk_cols.len() > 1 {
-        let key: Vec<Value> = all_pk_cols.iter().map(|&ci| row[ci].clone()).collect();
+    if pk_cols.len() > 1 {
+        let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
         if let Some(pk_idx) = pk_index {
             if pk_idx.contains_key(&key) {
                 return Err("duplicate key value violates unique constraint (pkey)".into());
