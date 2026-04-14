@@ -166,17 +166,23 @@ impl WalWriter {
         let mut state = self.inner.lock();
         let lsn = self.next_lsn.load(Ordering::SeqCst);
         let frame = encode_frame(lsn, tag, &payload);
+        // On failure, always use the full `rollback` — not a
+        // single-frame truncate. If a prior `append` call left
+        // un-flushed frames in the file, truncating to `durable_len`
+        // destroys them too, and without rewinding `next_lsn` the
+        // next write would skip those destroyed LSNs and produce a
+        // permanent gap recovery would treat as a torn tail.
         if let Err(e) = state.file.write_all(&frame) {
-            single_frame_rollback(&mut state);
+            rollback(&mut state, &self.next_lsn);
             return Err(format!("WAL write: {}", e));
         }
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            single_frame_rollback(&mut state);
+            rollback(&mut state, &self.next_lsn);
             return Err("WAL fsync: test injected failure".into());
         }
         if let Err(e) = state.file.sync_data() {
-            single_frame_rollback(&mut state);
+            rollback(&mut state, &self.next_lsn);
             return Err(format!("WAL fsync: {}", e));
         }
         let new_len = state
@@ -194,23 +200,15 @@ impl WalWriter {
     }
 }
 
-/// Rollback helper for `append_sync`'s single-frame scope. Unlike the
-/// batched `rollback`, this never touches `undurable_start_lsn` or
-/// `next_lsn`: because `append_sync` holds the mutex across the entire
-/// write+sync and advances `next_lsn` only on success, there is no
-/// cross-call LSN state to unwind. Truncating the file and resetting
-/// the cursor is enough.
-fn single_frame_rollback(state: &mut WriterState) {
-    let _ = state.file.set_len(state.durable_len);
-    let _ = state.file.seek(SeekFrom::Start(state.durable_len));
-}
-
-/// Roll the writer's state back to the last durable boundary. Called
-/// on any I/O failure so a later successful flush cannot resurrect a
-/// frame the caller was told had failed. Truncates the file, resets
-/// the write cursor to the durable tail (so the next append lands at
-/// the right offset instead of creating a hole), and rewinds
-/// `next_lsn` to the start of the un-flushed batch, if any.
+/// Roll the writer's state back to the last durable boundary. Used
+/// by both `append` + `flush_sync` and `append_sync` on any I/O
+/// failure so a later successful flush cannot resurrect a frame the
+/// caller was told had failed. Truncates the file, rewinds the write
+/// cursor (so the next append lands at the right offset instead of
+/// creating a hole), and — if there was an un-flushed batch in
+/// progress — rewinds `next_lsn` to the start of that batch so
+/// retries reclaim the lost LSNs rather than skipping past them and
+/// leaving a permanent gap recovery would mistake for a torn tail.
 fn rollback(state: &mut WriterState, next_lsn: &AtomicU64) {
     let _ = state.file.set_len(state.durable_len);
     let _ = state.file.seek(SeekFrom::Start(state.durable_len));

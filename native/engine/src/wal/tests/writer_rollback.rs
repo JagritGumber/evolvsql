@@ -159,6 +159,51 @@ fn concurrent_append_sync_with_failing_peer_preserves_other_thread_durability() 
 }
 
 #[test]
+fn failing_append_sync_with_prior_batched_frame_does_not_leave_lsn_gap() {
+    // Devin-found follow-up: when `append_sync` fails with prior
+    // `append` calls still un-flushed, its old rollback truncated
+    // the file but did not rewind `next_lsn`. The buffered frames
+    // were destroyed from the file but their LSNs stayed consumed,
+    // so the next write skipped past the destroyed range and
+    // produced a permanent gap that recovery mistakes for a torn
+    // tail, halting replay at the gap and losing every later frame.
+    //
+    //   1. append(A)       → lsn=1, undurable_start_lsn=Some(1)
+    //   2. append_sync(B)  → fails during sync. Old rollback
+    //                        truncated file but left next_lsn=2.
+    //   3. append_sync(C)  → would get lsn=2 under old behavior,
+    //                        leaving lsn=1 as a permanent gap.
+    //
+    // The fix routes append_sync's error paths through the full
+    // `rollback` helper, which rewinds next_lsn to the start of the
+    // destroyed batch.
+    let path = tmp("append_sync_gap");
+    let writer = WalWriter::open(&path, 1).unwrap();
+
+    let lsn_a = writer.append(insert_op(1, "a")).unwrap();
+    assert_eq!(lsn_a, 1);
+
+    writer.fail_next_sync.store(true, Ordering::SeqCst);
+    assert!(writer.append_sync(insert_op(2, "b")).is_err());
+
+    assert_eq!(
+        writer.peek_next_lsn(),
+        1,
+        "append_sync rollback must rewind past destroyed batched frames"
+    );
+
+    let entry_c = writer.append_sync(insert_op(3, "c")).unwrap();
+    assert_eq!(entry_c.lsn, 1, "retry must reclaim the reclaimed LSN");
+
+    drop(writer);
+    let entries = WalReader::open(&path).unwrap().read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].lsn, 1);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn append_sync_clears_undurable_marker_so_later_rollback_does_not_rewind_too_far() {
     // Devin-found: append_sync's success path used to leave
     // `undurable_start_lsn` stale. A subsequent batched append +
