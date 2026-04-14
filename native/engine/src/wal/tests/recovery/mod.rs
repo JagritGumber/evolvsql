@@ -25,6 +25,7 @@ mod alter_then_mutate;
 mod vector_alter;
 mod nif_boot;
 mod ddl_wal_first;
+mod ddl_phantom_wal;
 
 pub(super) fn tmp_recovery_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

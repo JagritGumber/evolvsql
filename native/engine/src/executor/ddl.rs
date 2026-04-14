@@ -35,7 +35,16 @@ pub(crate) fn exec_create_table(create: &pg_query::protobuf::CreateStmt) -> Resu
     // would have no record of the change and the next startup would
     // look the same as before the DDL — but any user code that ran in
     // the interim would have seen the table, producing ghost writes.
-    crate::wal::manager::append_create_table(&table)?;
+    //
+    // On WAL append failure we must also drop any SERIAL sequences
+    // that `parse_column_def` created up-front: until this point
+    // nothing references them, and if we leave them lying around a
+    // retry of the same CREATE TABLE fails with "sequence already
+    // exists" and the engine is stuck refusing that DDL forever.
+    crate::wal::manager::append_create_table(&table).map_err(|e| {
+        for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+        e
+    })?;
     catalog::create_table(table.clone())?;
     storage::create_table(schema, table_name);
     storage::setup_table_indexes(&table)?;
