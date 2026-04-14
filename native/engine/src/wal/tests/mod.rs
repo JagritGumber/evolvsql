@@ -9,6 +9,7 @@ mod payload;
 mod manager_tests;
 mod storage_integration;
 mod recovery;
+mod writer_concurrent;
 
 pub(super) fn tmp_wal_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

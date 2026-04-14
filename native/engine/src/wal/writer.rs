@@ -36,12 +36,21 @@ impl WalWriter {
 
     /// Append an operation and return the assigned LSN. Does NOT fsync.
     /// Call `flush_sync` to make writes durable.
+    ///
+    /// LSN assignment is done INSIDE the writer lock so that the order
+    /// of LSNs always matches the order of frames in the file. An
+    /// earlier version assigned LSNs via a separate atomic before the
+    /// lock; under concurrent appends that allowed a thread with a
+    /// lower LSN to write its frame after a thread with a higher one,
+    /// which would leave recovery replaying entries out of logical
+    /// order — and, worse, a torn-write tail could drop the
+    /// lower-LSN entry while keeping the higher-LSN one durable.
     pub fn append(&self, op: WalOp) -> Result<Lsn, String> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let payload = op.encode_payload()?;
         let tag = op.tag();
-        let frame = encode_frame(lsn, tag, &payload);
         let mut w = self.inner.lock();
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
+        let frame = encode_frame(lsn, tag, &payload);
         w.write_all(&frame).map_err(|e| format!("WAL write: {}", e))?;
         Ok(lsn)
     }
