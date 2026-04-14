@@ -179,33 +179,32 @@ pub fn delete_where(
 ) -> Result<u64, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
-    let before = table.rows.len();
-    // Collect deleted rows first so we can log them to WAL before
-    // committing the deletion. If WAL fsync fails, we abort without
-    // mutating storage.
-    let mut deleted_rows: Vec<Row> = Vec::new();
-    table.rows.retain_mut(|row| {
-        if predicate(row) {
-            deleted_rows.push(row.clone());
-            false
-        } else {
-            true
-        }
-    });
-    // WAL: append deletes before releasing the lock so recovery can
-    // reconstruct the exact mutation sequence.
-    for row in &deleted_rows {
+    // WAL-first: pick the indices to delete without mutating storage,
+    // fsync every Delete entry, then do the removal in reverse order.
+    // We can't re-run the predicate after the WAL step because some
+    // callers (e.g. recovery's apply_delete) use stateful FnMut
+    // predicates that stop after the first match.
+    let mut to_delete_idx: Vec<usize> = Vec::new();
+    for (i, row) in table.rows.iter().enumerate() {
+        if predicate(row) { to_delete_idx.push(i); }
+    }
+    for &i in &to_delete_idx {
+        let row = &table.rows[i];
         crate::wal::manager::append_delete(schema, name, row)?;
     }
-    let deleted = deleted_rows.len();
+    let deleted = to_delete_idx.len();
     if deleted > 0 {
+        // Remove back-to-front so earlier indices stay valid.
+        for &i in to_delete_idx.iter().rev() {
+            table.rows.remove(i);
+        }
         rebuild_indexes(&mut table);
     }
     Ok(deleted as u64)
 }
 
 /// Delete matching rows and return the deleted rows (for RETURNING clause).
-/// Uses retain + side-channel to avoid 2x memory allocation (#10).
+/// WAL-first: writes the WAL entries before mutating in-memory state.
 pub fn delete_where_returning(
     schema: &str,
     name: &str,
@@ -213,20 +212,18 @@ pub fn delete_where_returning(
 ) -> Result<Vec<Row>, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
-    let mut deleted = Vec::new();
-    table.rows.retain_mut(|row| {
-        if predicate(row) {
-            deleted.push(row.clone()); // clone only deleted rows
-            false
-        } else {
-            true
-        }
-    });
-    // WAL: log deletes for durability
+    let mut to_delete_idx: Vec<usize> = Vec::new();
+    for (i, row) in table.rows.iter().enumerate() {
+        if predicate(row) { to_delete_idx.push(i); }
+    }
+    let deleted: Vec<Row> = to_delete_idx.iter().map(|&i| table.rows[i].clone()).collect();
     for row in &deleted {
         crate::wal::manager::append_delete(schema, name, row)?;
     }
     if !deleted.is_empty() {
+        for &i in to_delete_idx.iter().rev() {
+            table.rows.remove(i);
+        }
         rebuild_indexes(&mut table);
     }
     Ok(deleted)
