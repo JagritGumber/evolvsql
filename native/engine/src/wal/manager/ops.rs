@@ -98,6 +98,14 @@ pub fn append_rename_column(schema: &str, table: &str, old_column: &str, new_col
 
 /// Shared append + fsync path. Returns the assigned LSN on success,
 /// or None if the WAL is disabled (making this a no-op for callers).
+///
+/// Goes through `append_sync` rather than the separated `append` +
+/// `flush_sync` pair so the two steps happen under a single
+/// acquisition of the writer's inner mutex. Without that, a
+/// concurrent caller's failing flush could roll back to `durable_len`
+/// and silently truncate this caller's already-appended frame,
+/// violating the durability contract even though this caller saw
+/// `Ok(...)`.
 fn append_op(op: WalOp) -> Result<Option<Lsn>, String> {
     #[cfg(test)]
     if FAIL_NEXT_APPEND.swap(false, Ordering::SeqCst) {
@@ -105,7 +113,6 @@ fn append_op(op: WalOp) -> Result<Option<Lsn>, String> {
     }
     let guard = WAL.read();
     let Some(writer) = guard.as_ref() else { return Ok(None); };
-    let lsn = writer.append(op)?;
-    writer.flush_sync()?;
-    Ok(Some(lsn))
+    let entry = writer.append_sync(op)?;
+    Ok(Some(entry.lsn))
 }
