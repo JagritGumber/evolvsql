@@ -11,8 +11,8 @@ use super::super::*;
 use super::{insert_op, tmp_wal_path};
 
 /// Overwrite the frame_len header of the Nth frame (0-indexed) with
-/// `value`. Returns the frame body length of every preceding frame
-/// for offset math the caller might need.
+/// `value`. Walks the preceding frames using their on-disk lengths
+/// so the seek lands on the right 4-byte header.
 fn overwrite_frame_len(path: &std::path::Path, target_idx: usize, value: u32) {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = OpenOptions::new().read(true).write(true).open(path).unwrap();
