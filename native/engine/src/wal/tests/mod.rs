@@ -5,6 +5,7 @@ use crate::types::Value;
 
 mod basic;
 mod corruption;
+mod corruption_modes;
 mod payload;
 mod manager_tests;
 mod storage_integration;
